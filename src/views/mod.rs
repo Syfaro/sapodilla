@@ -62,7 +62,7 @@ pub fn protocol_packets_table(
             });
         })
         .body(|body| {
-            body.rows(30.0, packets.len(), |mut row| {
+            body.rows(20.0, packets.len(), |mut row| {
                 let packet = &packets[row.index()];
 
                 row.col(|ui| {
@@ -174,7 +174,7 @@ pub fn packet_debug(
     show: &mut bool,
     packets: &Option<Result<Vec<AvocadoPacket>, ProtocolError>>,
 ) {
-    egui::Window::new("Avocado Packets")
+    egui::Window::new("Saved Packet Debugger")
         .open(show)
         .default_width(480.0)
         .default_height(320.0)
@@ -209,33 +209,36 @@ pub fn packet_debug(
             match packets {
                 Some(Ok(packets)) => {
                     for (index, packet) in packets.iter().enumerate() {
-                        ui.collapsing(format!("Packet {}", index + 1), |ui| {
-                            let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(
-                                ui.ctx(),
-                                ui.style(),
-                            );
-                            egui_extras::syntax_highlighting::code_view_ui(
-                                ui,
-                                &theme,
-                                &serde_json::to_string_pretty(packet).unwrap(),
-                                "json",
-                            );
-
-                            ui.separator();
-                            ui.heading("Packet Data - Hex");
-                            pretty_hex(ui, &packet.data);
-
-                            if let Some(data) = packet.as_json::<serde_json::Value>() {
-                                ui.separator();
-                                ui.heading("Packet Data - JSON");
+                        egui::CollapsingHeader::new(format!("Packet {}", index + 1))
+                            .default_open(packets.len() == 1)
+                            .show(ui, |ui| {
+                                let theme =
+                                    egui_extras::syntax_highlighting::CodeTheme::from_memory(
+                                        ui.ctx(),
+                                        ui.style(),
+                                    );
                                 egui_extras::syntax_highlighting::code_view_ui(
                                     ui,
                                     &theme,
-                                    &serde_json::to_string_pretty(&data).unwrap(),
+                                    &serde_json::to_string_pretty(packet).unwrap(),
                                     "json",
                                 );
-                            }
-                        });
+
+                                ui.separator();
+                                ui.heading("Packet Data - Hex");
+                                pretty_hex(ui, &packet.data);
+
+                                if let Some(data) = packet.as_json::<serde_json::Value>() {
+                                    ui.separator();
+                                    ui.heading("Packet Data - JSON");
+                                    egui_extras::syntax_highlighting::code_view_ui(
+                                        ui,
+                                        &theme,
+                                        &serde_json::to_string_pretty(&data).unwrap(),
+                                        "json",
+                                    );
+                                }
+                            });
                     }
                 }
                 Some(Err(err)) => {

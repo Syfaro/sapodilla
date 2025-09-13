@@ -36,6 +36,7 @@ pub struct SapodillaApp {
     packets: VecDeque<AvocadoPacket>,
     viewing_packet: Option<AvocadoPacket>,
 
+    showing_packet_log: bool,
     showing_avocado_packet_debug: bool,
     avocado_debug_packets: Option<Result<Vec<AvocadoPacket>, ProtocolError>>,
 
@@ -76,6 +77,7 @@ impl Default for SapodillaApp {
             packets: Default::default(),
             viewing_packet: None,
 
+            showing_packet_log: false,
             showing_avocado_packet_debug: false,
             avocado_debug_packets: Default::default(),
 
@@ -178,9 +180,11 @@ impl eframe::App for SapodillaApp {
                 });
 
                 ui.menu_button("Debug Tools", |ui| {
-                    if ui.button("Decode Packets From File").clicked() {
-                        self.showing_avocado_packet_debug = true;
-                    }
+                    ui.checkbox(&mut self.showing_packet_log, "Show Packet Log");
+                    ui.checkbox(
+                        &mut self.showing_avocado_packet_debug,
+                        "Saved Packet Debugger",
+                    );
                 });
             });
         });
@@ -294,10 +298,11 @@ impl eframe::App for SapodillaApp {
                 }
             }
 
-            egui::CollapsingHeader::new(format!("{} packets", self.packets.len()))
-                .id_salt("show_packets")
-                .show(ui, |ui| {
-                    views::protocol_packets_table(ui, &self.packets, &mut self.viewing_packet);
+            egui::Window::new("Packet Log")
+                .open(&mut self.showing_packet_log)
+                .default_size([1000.0, 300.0])
+                .show(ctx, |ui| {
+                    views::protocol_packets_table(ui, &self.packets, &mut self.viewing_packet)
                 });
 
             if let Some(err) = &self.error {
