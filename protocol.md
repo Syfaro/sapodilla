@@ -34,7 +34,7 @@ least 22 bytes, plus a variable length amount of data.
 | 16          | 2        | Message number within package, usually 1                                         |
 | 18          | 2        | Bitfield containing encryption type, length, and if it's a multi-message package |
 | 20          | variable | Data, length bytes long                                                          |
-| 20 + length | 1        | Checksum byte, saturating add of all previous bytes except prefix                |
+| 20 + length | 1        | Checksum byte, wrapping add of all previous bytes except prefix                  |
 | 21 + length | 1        | Suffix byte, always `0x7E`                                                       |
 
 The flags are a bitfield structured as follows.
