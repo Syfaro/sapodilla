@@ -1,9 +1,14 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, io::Cursor};
 
 use egui::{Id, Modal, Ui, Vec2};
 use egui_extras::{Column, TableBuilder};
+use tracing::debug;
 
-use crate::protocol::{self, AvocadoPacket, ProtocolError};
+use crate::{
+    app::Action,
+    protocol::{self, AvocadoPacket, AvocadoPacketReader, ProtocolError},
+    spawn,
+};
 
 pub fn protocol_packets_table(
     ui: &mut Ui,
@@ -154,7 +159,9 @@ pub fn pretty_hex(ui: &mut Ui, data: &[u8]) {
                     }
                 });
 
-                ui.monospace(String::from_utf8_lossy(row));
+                ui.monospace(
+                    String::from_utf8_lossy(row).replace(|c| !(' '..='~').contains(&c), " "),
+                );
 
                 ui.end_row();
             }
@@ -163,6 +170,7 @@ pub fn pretty_hex(ui: &mut Ui, data: &[u8]) {
 
 pub fn packet_debug(
     ctx: &egui::Context,
+    tx: &std::sync::mpsc::Sender<Action>,
     show: &mut bool,
     packets: &Option<Result<Vec<AvocadoPacket>, ProtocolError>>,
 ) {
@@ -172,43 +180,70 @@ pub fn packet_debug(
         .default_height(320.0)
         .resizable([true, true])
         .scroll(true)
-        .show(ctx, |ui| match packets {
-            Some(Ok(packets)) => {
-                for (index, packet) in packets.iter().enumerate() {
-                    ui.collapsing(format!("Packet {}", index + 1), |ui| {
-                        let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(
-                            ui.ctx(),
-                            ui.style(),
-                        );
-                        egui_extras::syntax_highlighting::code_view_ui(
-                            ui,
-                            &theme,
-                            &serde_json::to_string_pretty(packet).unwrap(),
-                            "json",
-                        );
+        .show(ctx, |ui| {
+            if ui.button("Select File").clicked() {
+                let ctx = ctx.clone();
+                let tx = tx.clone();
 
-                        ui.separator();
-                        ui.heading("Packet Data - Hex");
-                        pretty_hex(ui, &packet.data);
+                spawn(async move {
+                    let file = rfd::AsyncFileDialog::new().pick_file().await;
+                    if let Some(file) = file {
+                        let data = file.read().await;
 
-                        if let Some(data) = packet.as_json::<serde_json::Value>() {
-                            ui.separator();
-                            ui.heading("Packet Data - JSON");
+                        let mut maybe_hex_data = data.clone();
+                        maybe_hex_data.retain(|c| !c.is_ascii_whitespace());
+
+                        let data = hex::decode(&maybe_hex_data).unwrap_or(data);
+                        debug!("processed data: {}", hex::encode(&data));
+
+                        let cursor = Cursor::new(data);
+                        let avocado_packets: Result<Vec<_>, _> =
+                            AvocadoPacketReader::new(cursor).collect();
+                        tx.send(Action::LoadedAvocadoPackets(avocado_packets))
+                            .unwrap();
+                        ctx.request_repaint();
+                    }
+                });
+            }
+
+            match packets {
+                Some(Ok(packets)) => {
+                    for (index, packet) in packets.iter().enumerate() {
+                        ui.collapsing(format!("Packet {}", index + 1), |ui| {
+                            let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(
+                                ui.ctx(),
+                                ui.style(),
+                            );
                             egui_extras::syntax_highlighting::code_view_ui(
                                 ui,
                                 &theme,
-                                &serde_json::to_string_pretty(&data).unwrap(),
+                                &serde_json::to_string_pretty(packet).unwrap(),
                                 "json",
                             );
-                        }
-                    });
+
+                            ui.separator();
+                            ui.heading("Packet Data - Hex");
+                            pretty_hex(ui, &packet.data);
+
+                            if let Some(data) = packet.as_json::<serde_json::Value>() {
+                                ui.separator();
+                                ui.heading("Packet Data - JSON");
+                                egui_extras::syntax_highlighting::code_view_ui(
+                                    ui,
+                                    &theme,
+                                    &serde_json::to_string_pretty(&data).unwrap(),
+                                    "json",
+                                );
+                            }
+                        });
+                    }
                 }
-            }
-            Some(Err(err)) => {
-                ui.label(format!("Error! {err}"));
-            }
-            None => {
-                ui.label("No packets loaded");
+                Some(Err(err)) => {
+                    ui.label(format!("Error! {err}"));
+                }
+                None => {
+                    ui.label("No packets loaded");
+                }
             }
         });
 }

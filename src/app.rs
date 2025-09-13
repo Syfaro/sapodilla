@@ -1,20 +1,20 @@
-use std::{borrow::Cow, collections::VecDeque, io::Cursor, sync::mpsc};
+use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
 
 use egui::{Id, Modal};
 use futures::{StreamExt, lock::Mutex};
 use strum::IntoEnumIterator;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info};
 
 use crate::{
     Rc,
-    protocol::{AvocadoPacket, AvocadoPacketReader, EncodingType, EncryptionMode, ProtocolError},
+    protocol::{AvocadoPacket, EncodingType, EncryptionMode, ProtocolError},
     spawn,
     transports::{Transport, TransportControl, TransportEvent, TransportStatus},
     views,
 };
 
 #[derive(derive_more::Debug)]
-enum Action {
+pub enum Action {
     Error(anyhow::Error),
     ChangeTransport(usize),
     TransportEvent(TransportEvent),
@@ -178,27 +178,8 @@ impl eframe::App for SapodillaApp {
                 });
 
                 ui.menu_button("Debug Tools", |ui| {
-                    if ui.button("Decode Packets").clicked() {
+                    if ui.button("Decode Packets From File").clicked() {
                         self.showing_avocado_packet_debug = true;
-                        let ctx = ctx.clone();
-                        let tx = self.tx.clone();
-
-                        spawn(async move {
-                            let file = rfd::AsyncFileDialog::new().pick_file().await;
-                            if let Some(file) = file {
-                                let mut data = file.read().await;
-                                data.retain(|c| !c.is_ascii_whitespace());
-                                trace!("got data: {data:?}");
-                                let data = hex::decode(&data).unwrap_or(data);
-                                debug!("processed data: {}", hex::encode(&data));
-                                let cursor = Cursor::new(data);
-                                let avocado_packets: Result<Vec<_>, _> =
-                                    AvocadoPacketReader::new(cursor).collect();
-                                tx.send(Action::LoadedAvocadoPackets(avocado_packets))
-                                    .unwrap();
-                                ctx.request_repaint();
-                            }
-                        });
                     }
                 });
             });
@@ -283,7 +264,7 @@ impl eframe::App for SapodillaApp {
                 }
 
                 TransportStatus::Disconnected => {
-                    if ui.button("connect transport").clicked() {
+                    if ui.button("Connect").clicked() {
                         let transport = self.get_transport();
 
                         let tx = self.tx.clone();
@@ -339,6 +320,7 @@ impl eframe::App for SapodillaApp {
 
         views::packet_debug(
             ctx,
+            &self.tx,
             &mut self.showing_avocado_packet_debug,
             &self.avocado_debug_packets,
         );
