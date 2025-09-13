@@ -56,11 +56,18 @@ impl TransportControl for WebSerialTransport {
         false
     }
 
-    async fn start(&mut self) -> Result<mpsc::UnboundedReceiver<TransportEvent>, anyhow::Error> {
+    async fn start(
+        &mut self,
+        mut event_tx: mpsc::UnboundedSender<TransportEvent>,
+    ) -> Result<(), anyhow::Error> {
         let navigator = web_sys::window().unwrap().navigator();
         if !js_sys::Reflect::has(&navigator, &JsValue::from_str("serial")).unwrap() {
             anyhow::bail!("navigator does not have serial API");
         }
+
+        event_tx
+            .send(TransportEvent::StatusChange(TransportStatus::Connecting))
+            .await?;
 
         let serial = navigator.serial();
         let port = JsFuture::from(serial.request_port())
@@ -69,7 +76,6 @@ impl TransportControl for WebSerialTransport {
 
         let port: &SerialPort = port.dyn_ref().unwrap();
 
-        let (mut event_tx, event_rx) = mpsc::unbounded();
         let (action_tx, action_rx) = mpsc::unbounded();
 
         JsFuture::from(port.open(&SerialOptions::new(9600)))
@@ -84,7 +90,7 @@ impl TransportControl for WebSerialTransport {
 
         self.tx = Some(action_tx);
 
-        Ok(event_rx)
+        Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
@@ -216,7 +222,7 @@ impl WebSerialHandler {
                     let data = packet.encode();
                     let data = js_sys::Uint8Array::new_from_slice(&data);
 
-                    wasm_bindgen_futures::JsFuture::from(writer.write_with_chunk(&data))
+                    JsFuture::from(writer.write_with_chunk(&data))
                         .await
                         .map_err(|err| anyhow!("could not write chunk: {err:?}"))?;
                 }
