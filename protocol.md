@@ -41,7 +41,7 @@ The flags are a bitfield structured as follows.
 
 | Bit | Length | Description                                      |
 | --- | ------ | ------------------------------------------------ |
-| 0   | 9      | Length of the data                               |
+| 0   | 10     | Length of the data                               |
 | 10  | 1      | If the package is made of multiple messages      |
 | 11  | 3      | Encryption mode, `0x00` for none, `0x02` for RC4 |
 
