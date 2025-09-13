@@ -276,3 +276,64 @@ first then the JPEG as a combined package.
 
 Remember that when sending data, the job ID must be prepended in the data of
 each message in the package.
+
+## ImHex Pattern
+
+While trying to decode this pattern, I wrote an ImHex pattern to decode the
+packets. To avoid it getting lost forever, I've also attached it here.
+
+<details>
+
+<summary>ImHex Pattern Code</summary>
+
+```
+#pragma endian little
+
+#include <std/core>
+#include <type/magic>
+
+enum ConnectType: u8 {
+    Msg = 1,
+    Data = 2
+};
+
+enum InteractionType: u8 {
+    Request = 6,
+    Response = 7
+};
+
+enum EncodingType: u8 {
+    Hexadecimal = 2,
+    Json = 3
+};
+
+enum EncryptionType: u8 {
+    None = 0b000,
+    RC4 = 0b010
+};
+
+bitfield PackageFlags {
+    length: 10;
+    EncryptionType encryption_type: 3;
+    bool subpackage: 1;
+} [[bitfield_order(std::core::BitfieldOrder::LeastToMostSignificant, 16)]];
+
+struct HanntoPackage {
+    type::Magic<"\x7E"> start;
+    u8 version;
+    u8 reserved;
+    ConnectType connect_type;
+    InteractionType interaction_type;
+    EncodingType encoding_type;
+    u32 terminal_id;
+    u32 msg_number;
+    u16 msg_package_total;
+    u16 msg_package_num;
+    PackageFlags flags;
+    u8 body[flags.length];
+    u8 checksum;
+    type::Magic<"\x7E"> end;
+};
+```
+
+</details>
