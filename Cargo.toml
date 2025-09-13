@@ -1,0 +1,58 @@
+[package]
+name = "sapodilla"
+version = "0.1.0"
+edition = "2024"
+publish = false
+authors = ["Syfaro <syfaro@huefox.com>"]
+
+[dependencies]
+anyhow = "1.0.99"
+async-trait = "0.1.89"
+bitflags = "2.9"
+byteorder = "1.5.0"
+eframe = { version = "0.32.3", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+] }
+egui = "0.32.3"
+egui_extras = { version = "0.32.3", features = ["syntect"] }
+enum_dispatch = "0.3.13"
+futures = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+hex = "0.4.3"
+hex-literal = "1"
+oneshot = "0.1"
+packed_struct = "0.10"
+rfd = "0.15.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.143"
+thiserror = "2.0.16"
+tracing = "0.1"
+web-sys = { version = "0.3", features = [
+    "Serial",
+    "SerialPort",
+    "SerialPortInfo",
+    "SerialOptions",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Performance",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "Window"
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-subscriber = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+wasm-bindgen-futures = "0.4.50"
+wasm-tracing = "2.1.0"
+web-sys = "0.3.70"
+
+[profile.release]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2

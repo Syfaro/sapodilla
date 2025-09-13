@@ -1,0 +1,37 @@
+on:
+  push:
+
+jobs:
+  publish:
+    name: Publish to Cloudflare Pages
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Install trunk
+        run: cargo install --locked trunk
+
+      - name: Build dist
+        run: trunk build --release
+
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: pages deploy dist --project-name=sapodilla
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
