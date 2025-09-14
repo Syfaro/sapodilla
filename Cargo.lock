@@ -946,6 +946,7 @@ dependencies = [
  "ahash",
  "egui",
  "enum-map",
+ "image",
  "log",
  "mime_guess2",
  "profiling",
@@ -1599,6 +1600,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2732,6 +2735,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bitflags 2.9.4",
  "byteorder",
  "console_error_panic_hook",
@@ -2744,6 +2748,7 @@ dependencies = [
  "gloo-timers",
  "hex",
  "hex-literal",
+ "image",
  "oneshot",
  "packed_struct",
  "rfd",
@@ -2754,6 +2759,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wasm-bindgen-futures",
  "wasm-tracing",
  "web-sys",
@@ -3290,6 +3296,17 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "uuid"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
+dependencies = [
+ "getrandom",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"

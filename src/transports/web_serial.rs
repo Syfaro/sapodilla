@@ -304,10 +304,10 @@ impl WebSerialHandler {
                 id: u32,
             }
 
-            if let Some(data) = packet.as_json::<PacketDataWithId>() {
-                if let Some(cb) = pending.lock().remove(&data.id) {
-                    cb(packet);
-                }
+            if let Some(data) = packet.as_json::<PacketDataWithId>()
+                && let Some(cb) = pending.lock().remove(&data.id)
+            {
+                cb(packet);
             }
         }
     }
