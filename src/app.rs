@@ -1,12 +1,10 @@
 use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
 
-use base64::Engine;
-use eframe::wasm_bindgen::JsCast;
 use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2, emath};
 use futures::{StreamExt, lock::Mutex};
-use image::{EncodableLayout, GenericImage, GenericImageView};
+use image::{EncodableLayout, GenericImageView};
 use strum::IntoEnumIterator;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -54,7 +52,7 @@ pub struct SapodillaApp {
 pub struct LoadedImage {
     sized_texture: egui::load::SizedTexture,
     offset: Pos2,
-    image: image::RgbImage,
+    image: image::RgbaImage,
 
     // We need this handle so egui doesn't drop the texture.
     #[allow(dead_code)]
@@ -86,43 +84,46 @@ impl SapodillaApp {
             if let Some(file) = file {
                 let data = file.read().await;
 
-                let im = match image::load_from_memory(&data) {
-                    Ok(im) => im,
-                    Err(err) => {
-                        tx.send(Action::LoadedImage(Err(err.into()))).unwrap();
-                        return;
-                    }
+                let action = match Self::prepare_file(&ctx, &data) {
+                    Ok(image) => Action::LoadedImage(Ok(image)),
+                    Err(err) => Action::LoadedImage(Err(err)),
                 };
 
-                let (width, height) = im.dimensions();
-
-                let im = im.to_rgb8();
-                let color_image =
-                    egui::ColorImage::from_rgb([width as usize, height as usize], im.as_bytes());
-
-                let handle =
-                    ctx.load_texture(Uuid::new_v4(), color_image, egui::TextureOptions::LINEAR);
-
-                let sized_texture = egui::load::SizedTexture::new(
-                    handle.id(),
-                    Vec2::new(width as f32, height as f32),
-                );
-
-                tx.send(Action::LoadedImage(Ok(LoadedImage {
-                    handle,
-                    sized_texture,
-                    image: im,
-                    offset: Pos2::ZERO,
-                })))
-                .unwrap();
+                tx.send(action).unwrap();
                 ctx.request_repaint();
             }
         });
     }
 
+    fn prepare_file(ctx: &egui::Context, data: &[u8]) -> anyhow::Result<LoadedImage> {
+        let im = image::load_from_memory(data)?;
+        trace!("loaded image");
+
+        let (width, height) = im.dimensions();
+
+        let im = im.to_rgba8();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            im.as_bytes(),
+        );
+
+        let handle = ctx.load_texture(Uuid::new_v4(), color_image, egui::TextureOptions::LINEAR);
+
+        let sized_texture =
+            egui::load::SizedTexture::new(handle.id(), Vec2::new(width as f32, height as f32));
+        trace!("finished creating textures");
+
+        Ok(LoadedImage {
+            handle,
+            sized_texture,
+            image: im,
+            offset: Pos2::ZERO,
+        })
+    }
+
     fn render_image(&self) -> image::DynamicImage {
         let mut buf =
-            image::ImageBuffer::from_pixel(4 * 300, 6 * 300, image::Rgb([255u8, 255, 255]));
+            image::ImageBuffer::from_pixel(4 * 300, 6 * 300, image::Rgba([255u8, 255, 255, 255]));
 
         for loaded_image in &self.loaded_images {
             let offset_x = loaded_image.offset.x as i32;
@@ -162,7 +163,7 @@ impl SapodillaApp {
                 )
                 .to_image();
 
-            buf.copy_from(&view, end_x as u32, end_y as u32).unwrap();
+            image::imageops::overlay(&mut buf, &view, end_x as i64, end_y as i64);
         }
 
         buf.into()
@@ -348,16 +349,19 @@ impl eframe::App for SapodillaApp {
                             buf.clear();
                         }
 
-                        let mut output = String::from("data:image/jpeg;base64,");
-                        base64::engine::general_purpose::STANDARD.encode_string(&buf, &mut output);
+                        spawn(async move {
+                            let Some(handle) = rfd::AsyncFileDialog::new()
+                                .set_file_name("canvas.jpg")
+                                .save_file()
+                                .await
+                            else {
+                                return;
+                            };
 
-                        let doc = web_sys::window().unwrap().document().unwrap();
-                        let link = doc.create_element("a").unwrap();
-                        link.set_attribute("href", &output).unwrap();
-                        link.set_attribute("download", "canvas.jpeg").unwrap();
-
-                        let link: &web_sys::HtmlAnchorElement = link.dyn_ref().unwrap();
-                        link.click();
+                            if let Err(err) = handle.write(&buf).await {
+                                error!("could not write canvas image: {err}");
+                            }
+                        });
                     }
                 });
             });
@@ -571,6 +575,44 @@ impl eframe::App for SapodillaApp {
             if response.double_clicked() {
                 self.canvas_rect = inner_rect.shrink(ui.style().spacing.menu_spacing);
             }
+
+            ctx.input(|i| {
+                if i.raw.dropped_files.is_empty() {
+                    return;
+                }
+
+                let mut files: Vec<Vec<u8>> = Vec::with_capacity(i.raw.dropped_files.len());
+
+                for file in i.raw.dropped_files.iter() {
+                    debug!("processing file");
+                    let data = if cfg!(target_arch = "wasm32") {
+                        match &file.bytes {
+                            Some(bytes) => bytes.to_vec(),
+                            None => continue,
+                        }
+                    } else if let Some(path) = &file.path {
+                        let mut file = std::fs::File::open(path).unwrap();
+                        let mut buf = Vec::new();
+                        std::io::Read::read_to_end(&mut file, &mut buf).unwrap();
+                        buf
+                    } else {
+                        continue;
+                    };
+
+                    debug!("got file contents");
+                    files.push(data);
+                }
+
+                let ctx = ctx.clone();
+                let tx = self.tx.clone();
+                spawn(async move {
+                    for file in files {
+                        tx.send(Action::LoadedImage(Self::prepare_file(&ctx, &file)))
+                            .unwrap();
+                        ctx.request_repaint();
+                    }
+                })
+            });
 
             if let Some(err) = &self.error {
                 let modal = Modal::new(Id::new("error_modal")).show(ui.ctx(), |ui| {
