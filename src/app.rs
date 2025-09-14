@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
 
 use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2, emath};
-use futures::{StreamExt, lock::Mutex};
+use futures::lock::Mutex;
 use image::{EncodableLayout, GenericImageView};
 use strum::IntoEnumIterator;
 use tracing::{debug, error, info, trace};
@@ -11,7 +11,7 @@ use crate::{
     Rc,
     protocol::{AvocadoPacket, EncodingType, EncryptionMode, ProtocolError},
     spawn,
-    transports::{Transport, TransportControl, TransportEvent, TransportStatus},
+    transports::{Transport, TransportControl, TransportEvent, TransportManager, TransportStatus},
     views,
 };
 
@@ -20,7 +20,6 @@ pub enum Action {
     Error(anyhow::Error),
     ChangeTransport(usize),
     TransportEvent(TransportEvent),
-    GotPacket(AvocadoPacket),
     LoadedAvocadoPackets(Result<Vec<AvocadoPacket>, ProtocolError>),
     LoadedImage(#[debug(skip)] anyhow::Result<LoadedImage>),
 }
@@ -33,9 +32,9 @@ pub struct SapodillaApp {
     transport_names: Vec<Cow<'static, str>>,
     selected_transport_index: usize,
 
+    transport_manager: Option<TransportManager>,
     transport_status: TransportStatus,
 
-    packet_id: u32,
     packets: VecDeque<AvocadoPacket>,
     viewing_packet: Option<AvocadoPacket>,
 
@@ -60,10 +59,6 @@ pub struct LoadedImage {
 }
 
 impl SapodillaApp {
-    fn has_connected_transport(&self) -> bool {
-        self.transport_status != TransportStatus::Disconnected
-    }
-
     fn get_transport(&self) -> Rc<Mutex<Transport>> {
         self.transports
             .get(self.selected_transport_index)
@@ -185,9 +180,10 @@ impl Default for SapodillaApp {
                 .map(|transport| transport.name())
                 .collect(),
             selected_transport_index: 0,
-            transport_status: TransportStatus::Disconnected,
 
-            packet_id: 0,
+            transport_status: TransportStatus::Disconnected,
+            transport_manager: None,
+
             packets: Default::default(),
             viewing_packet: None,
 
@@ -220,13 +216,9 @@ impl eframe::App for SapodillaApp {
                 Action::Error(err) => {
                     self.error = Some(err);
 
-                    if self.has_connected_transport() {
-                        self.transport_status = TransportStatus::Disconnected;
-
-                        let transport = self.get_transport();
-
+                    if let Some(manager) = self.transport_manager.take() {
                         spawn(async move {
-                            if let Err(err) = transport.lock().await.disconnect().await {
+                            if let Err(err) = manager.disconnect().await {
                                 error!("could not disconnect from transport after error: {err}");
                             }
                         });
@@ -236,6 +228,13 @@ impl eframe::App for SapodillaApp {
                     self.selected_transport_index = index;
                 }
                 Action::TransportEvent(event) => match event {
+                    TransportEvent::Packet(packet) => {
+                        if self.packets.len() >= 999 {
+                            self.packets.pop_back();
+                        }
+
+                        self.packets.push_front(packet);
+                    }
                     TransportEvent::StatusChange(status) => {
                         self.transport_status = status;
                     }
@@ -243,13 +242,7 @@ impl eframe::App for SapodillaApp {
                         self.error = Some(err);
                     }
                 },
-                Action::GotPacket(packet) => {
-                    if self.packets.len() >= 999 {
-                        self.packets.pop_back();
-                    }
 
-                    self.packets.push_front(packet);
-                }
                 Action::LoadedAvocadoPackets(packets) => self.avocado_debug_packets = Some(packets),
                 Action::LoadedImage(res) => match res {
                     Ok(image) => {
@@ -296,15 +289,12 @@ impl eframe::App for SapodillaApp {
                                 .radio(self.selected_transport_index == index, transport.as_ref())
                                 .clicked()
                             {
-                                if self.has_connected_transport() {
-                                    let tx = self.tx.clone();
+                                if let Some(manager) = self.transport_manager.take() {
                                     self.transport_status = TransportStatus::Disconnecting;
 
-                                    let transport = self.get_transport();
-
+                                    let tx = self.tx.clone();
                                     spawn(async move {
-                                        if let Err(err) = transport.lock().await.disconnect().await
-                                        {
+                                        if let Err(err) = manager.disconnect().await {
                                             tx.send(Action::Error(err)).unwrap();
                                         } else {
                                             tx.send(Action::ChangeTransport(index)).unwrap();
@@ -382,63 +372,57 @@ impl eframe::App for SapodillaApp {
 
                 match self.transport_status {
                     TransportStatus::Connected => {
-                        if ui.button("Disconnect").clicked() {
-                            let transport = self.get_transport();
+                        if ui.button("Disconnect").clicked()
+                            && let Some(manager) = self.transport_manager.take()
+                        {
+                            let tx = self.tx.clone();
                             spawn(async move {
-                                transport.lock().await.disconnect().await.unwrap();
+                                if let Err(err) = manager.disconnect().await {
+                                    tx.send(Action::Error(err)).unwrap();
+                                }
                             });
                         }
 
                         if ui.button("Send Get Prop Packet").clicked() {
-                            self.packet_id += 1;
-                            let transport = self.get_transport();
-                            let id = self.packet_id;
-                            let tx = self.tx.clone();
-                            let ctx = ctx.clone();
+                            let manager = self.transport_manager.clone().unwrap();
+                            let id = manager.next_message_id();
 
                             spawn(async move {
-                                transport
-                                    .lock()
-                                    .await
-                                    .send_packet(
-                                        AvocadoPacket {
-                                            version: 100,
-                                            content_type: crate::protocol::ContentType::Message,
-                                            interaction_type:
-                                                crate::protocol::InteractionType::Request,
-                                            encoding_type: EncodingType::Json,
-                                            encryption_mode: EncryptionMode::None,
-                                            terminal_id: id,
-                                            msg_number: id,
-                                            msg_package_total: 1,
-                                            msg_package_num: 1,
-                                            is_subpackage: false,
-                                            data: serde_json::to_vec(&serde_json::json!({
-                                                "id" : id,
-                                                "method" : "get-prop",
-                                                "params" : [
-                                                    "model",
-                                                    "mac-address",
-                                                    "serial-number",
-                                                    "sn-pcba",
-                                                    "firmware-revision",
-                                                    "hardware-revision",
-                                                    "bt-phone-mac",
-                                                    "printer-state",
-                                                    "printer-sub-state",
-                                                    "printer-state-alerts",
-                                                    "auto-off-interval"
-                                                ]
-                                            }))
-                                            .unwrap(),
-                                        },
-                                        move |packet| {
-                                            tx.send(Action::GotPacket(packet)).unwrap();
-                                            ctx.request_repaint();
-                                        },
-                                    )
+                                let packet = manager
+                                    .wait_for_response(AvocadoPacket {
+                                        version: 100,
+                                        content_type: crate::protocol::ContentType::Message,
+                                        interaction_type: crate::protocol::InteractionType::Request,
+                                        encoding_type: EncodingType::Json,
+                                        encryption_mode: EncryptionMode::None,
+                                        terminal_id: id,
+                                        msg_number: id,
+                                        msg_package_total: 1,
+                                        msg_package_num: 1,
+                                        is_subpackage: false,
+                                        data: serde_json::to_vec(&serde_json::json!({
+                                            "id" : id,
+                                            "method" : "get-prop",
+                                            "params" : [
+                                                "model",
+                                                "mac-address",
+                                                "serial-number",
+                                                "sn-pcba",
+                                                "firmware-revision",
+                                                "hardware-revision",
+                                                "bt-phone-mac",
+                                                "printer-state",
+                                                "printer-sub-state",
+                                                "printer-state-alerts",
+                                                "auto-off-interval"
+                                            ]
+                                        }))
+                                        .unwrap(),
+                                    })
                                     .await
                                     .unwrap();
+
+                                info!("got info packet: {packet:?}");
                             });
                         }
                     }
@@ -458,31 +442,21 @@ impl eframe::App for SapodillaApp {
 
                     TransportStatus::Disconnected => {
                         if ui.button("Connect").clicked() {
-                            let transport = self.get_transport();
                             let tx = self.tx.clone();
                             let ctx = ctx.clone();
 
-                            spawn(async move {
-                                let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded();
-
-                                spawn({
-                                    let tx = tx.clone();
-                                    let ctx = ctx.clone();
-
-                                    async move {
-                                        while let Some(event) = event_rx.next().await {
-                                            tx.send(Action::TransportEvent(event)).unwrap();
-                                            ctx.request_repaint();
-                                        }
+                            let manager = TransportManager::new(
+                                self.get_transport(),
+                                Some(move |event: TransportEvent| {
+                                    if let Err(err) = tx.send(Action::TransportEvent(event)) {
+                                        error!("could not send transport event: {err}");
                                     }
-                                });
 
-                                let mut transport = transport.lock().await;
-                                if let Err(err) = transport.start(event_tx).await {
-                                    tx.send(Action::Error(err)).unwrap();
                                     ctx.request_repaint();
-                                }
-                            });
+                                }),
+                            );
+
+                            self.transport_manager = Some(manager);
                         }
                     }
                 }

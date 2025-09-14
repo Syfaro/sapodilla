@@ -1,22 +1,18 @@
 use std::borrow::Cow;
 use std::io::Cursor;
-use std::rc::Rc;
 
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use eframe::wasm_bindgen::{JsCast, JsValue};
-use egui::ahash::HashMap;
-use egui::mutex::Mutex;
 use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
-use serde::Deserialize;
 use tracing::{debug, error, info, trace, warn};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStreamDefaultReader, SerialOptions, SerialPort, WritableStreamDefaultWriter, js_sys,
 };
 
-use crate::transports::{AvocadoCallbackFn, TransportStatus};
+use crate::transports::TransportStatus;
 use crate::{
     protocol,
     transports::{TransportControl, TransportEvent},
@@ -24,21 +20,8 @@ use crate::{
 
 #[derive(Debug)]
 enum TransportAction {
-    SendPacket(TransportPacketCallback),
+    SendPacket(protocol::AvocadoPacket),
     Disconnect,
-}
-
-struct TransportPacketCallback {
-    packet: protocol::AvocadoPacket,
-    cb: AvocadoCallbackFn,
-}
-
-impl std::fmt::Debug for TransportPacketCallback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TransportPacketCallback")
-            .field("packet", &self.packet)
-            .finish_non_exhaustive()
-    }
 }
 
 #[derive(Default)]
@@ -103,23 +86,12 @@ impl TransportControl for WebSerialTransport {
         Ok(())
     }
 
-    async fn send_packet<F>(
-        &mut self,
-        packet: protocol::AvocadoPacket,
-        cb: F,
-    ) -> Result<(), anyhow::Error>
-    where
-        F: FnOnce(protocol::AvocadoPacket) + Send + Sync + 'static,
-    {
+    async fn send_packet(&mut self, packet: protocol::AvocadoPacket) -> Result<(), anyhow::Error> {
         let Some(tx) = self.tx.as_mut() else {
             bail!("transport was not started");
         };
 
-        tx.send(TransportAction::SendPacket(TransportPacketCallback {
-            packet,
-            cb: Box::new(cb),
-        }))
-        .await?;
+        tx.send(TransportAction::SendPacket(packet)).await?;
 
         Ok(())
     }
@@ -129,7 +101,6 @@ struct WebSerialHandler {
     action_rx: mpsc::UnboundedReceiver<TransportAction>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     port: SerialPort,
-    pending: HashMap<u32, AvocadoCallbackFn>,
 }
 
 impl WebSerialHandler {
@@ -142,7 +113,6 @@ impl WebSerialHandler {
             action_rx,
             event_tx,
             port,
-            pending: Default::default(),
         };
 
         wasm_bindgen_futures::spawn_local(handler.run());
@@ -154,11 +124,8 @@ impl WebSerialHandler {
         let reader = ReadableStreamDefaultReader::new(&self.port.readable()).unwrap();
         let writer = self.port.writable().get_writer().unwrap();
 
-        let pending = Rc::new(Mutex::new(self.pending));
-
-        let mut action_task =
-            Box::pin(Self::action_task(self.action_rx, stop_tx, &writer, pending.clone()).fuse());
-        let mut read_task = Box::pin(Self::read_task(&reader, pending).fuse());
+        let mut action_task = Box::pin(Self::action_task(self.action_rx, stop_tx, &writer).fuse());
+        let mut read_task = Box::pin(Self::read_task(&reader, self.event_tx.clone()).fuse());
 
         futures::select! {
             _ = stop_rx.fuse() => {
@@ -210,15 +177,12 @@ impl WebSerialHandler {
         mut action_rx: mpsc::UnboundedReceiver<TransportAction>,
         stop_tx: oneshot::Sender<()>,
         writer: &WritableStreamDefaultWriter,
-        pending: Rc<Mutex<HashMap<u32, AvocadoCallbackFn>>>,
     ) -> anyhow::Result<()> {
         while let Some(action) = action_rx.next().await {
             debug!("got action: {action:?}");
 
             match action {
-                TransportAction::SendPacket(TransportPacketCallback { packet, cb }) => {
-                    pending.lock().insert(packet.msg_number, cb);
-
+                TransportAction::SendPacket(packet) => {
                     let data = packet.encode();
                     let data = js_sys::Uint8Array::new_from_slice(&data);
 
@@ -244,7 +208,7 @@ impl WebSerialHandler {
 
     async fn read_task(
         reader: &ReadableStreamDefaultReader,
-        pending: Rc<Mutex<HashMap<u32, AvocadoCallbackFn>>>,
+        mut event_tx: mpsc::UnboundedSender<TransportEvent>,
     ) -> anyhow::Result<()> {
         let mut buf: Vec<u8> = Vec::new();
 
@@ -299,16 +263,7 @@ impl WebSerialHandler {
 
             debug!(read_bytes, "got packet: {packet:?}");
 
-            #[derive(Deserialize)]
-            struct PacketDataWithId {
-                id: u32,
-            }
-
-            if let Some(data) = packet.as_json::<PacketDataWithId>()
-                && let Some(cb) = pending.lock().remove(&data.id)
-            {
-                cb(packet);
-            }
+            event_tx.send(TransportEvent::Packet(packet)).await?;
         }
     }
 }

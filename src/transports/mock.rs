@@ -37,14 +37,7 @@ impl TransportControl for MockTransport {
         Ok(())
     }
 
-    async fn send_packet<F>(
-        &mut self,
-        _packet: protocol::AvocadoPacket,
-        _cb: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce(protocol::AvocadoPacket) + Send + Sync + 'static,
-    {
+    async fn send_packet(&mut self, _packet: protocol::AvocadoPacket) -> anyhow::Result<()> {
         Ok(())
     }
 }
