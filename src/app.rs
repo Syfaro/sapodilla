@@ -9,19 +9,7 @@ use strum::IntoEnumIterator;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
-use crate::{
-    Rc,
-    protocol::{
-        AvocadoPacket, EncodingType, EncryptionMode, JobStatusInfo, PrinterState, PrinterSubState,
-        ProtocolError,
-    },
-    spawn,
-    transports::{
-        AvocadoResult, Transport, TransportControl, TransportEvent, TransportManager,
-        TransportStatus,
-    },
-    views,
-};
+use crate::{Rc, protocol::*, spawn, transports::*, views};
 
 #[derive(derive_more::Debug)]
 pub enum Action {
@@ -34,7 +22,7 @@ pub enum Action {
 }
 
 pub struct SapodillaApp {
-    tx: mpsc::Sender<Action>,
+    tx: ContextSender<Action>,
     rx: mpsc::Receiver<Action>,
 
     transports: Vec<Rc<Mutex<Transport>>>,
@@ -58,6 +46,32 @@ pub struct SapodillaApp {
     loaded_images: Vec<LoadedImage>,
 
     error: Option<anyhow::Error>,
+}
+
+pub struct ContextSender<A> {
+    tx: mpsc::Sender<A>,
+    ctx: egui::Context,
+}
+
+impl<A> Clone for ContextSender<A> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            ctx: self.ctx.clone(),
+        }
+    }
+}
+
+impl<A> ContextSender<A> {
+    pub fn new(tx: mpsc::Sender<A>, ctx: egui::Context) -> Self {
+        Self { tx, ctx }
+    }
+
+    pub fn send(&self, action: A) -> Result<(), mpsc::SendError<A>> {
+        self.tx.send(action)?;
+        self.ctx.request_repaint();
+        Ok(())
+    }
 }
 
 pub struct LoadedImage {
@@ -97,7 +111,6 @@ impl SapodillaApp {
                 };
 
                 tx.send(action).unwrap();
-                ctx.request_repaint();
             }
         });
     }
@@ -177,9 +190,12 @@ impl SapodillaApp {
     }
 }
 
-impl Default for SapodillaApp {
-    fn default() -> Self {
+impl SapodillaApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let (tx, rx) = mpsc::channel();
+        let tx = ContextSender::new(tx, cc.egui_ctx.clone());
 
         Self {
             tx,
@@ -211,14 +227,6 @@ impl Default for SapodillaApp {
 
             error: None,
         }
-    }
-}
-
-impl SapodillaApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-
-        Default::default()
     }
 }
 
@@ -260,7 +268,7 @@ impl eframe::App for SapodillaApp {
                     TransportEvent::DeviceStatus(status) => {
                         self.device_status = Some(status);
                     }
-                    TransportEvent::JobStatus((_, status)) => {
+                    TransportEvent::JobStatus(status) => {
                         self.job_status = Some(status);
                     }
                     TransportEvent::Error(err) => {
@@ -296,7 +304,8 @@ impl eframe::App for SapodillaApp {
                     });
                 }
 
-                let image_shortcut = KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::U);
+                let image_shortcut =
+                    KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::U);
                 if ui.input_mut(|i| i.consume_shortcut(&image_shortcut)) {
                     self.upload_image(ctx);
                 }
@@ -318,17 +327,17 @@ impl eframe::App for SapodillaApp {
                                 .clicked()
                             {
                                 if let Some(manager) = self.transport_manager.take() {
-                                    self.transport_status = TransportStatus::Disconnecting;
-
                                     let tx = self.tx.clone();
-                                    let ctx = ctx.clone();
                                     spawn(async move {
-                                        if let Err(err) = manager.disconnect().await {
-                                            tx.send(Action::Error(err)).unwrap();
+                                        let action = if let Err(err) = manager.disconnect().await {
+                                            Action::Error(err)
                                         } else {
-                                            tx.send(Action::ChangeTransport(index)).unwrap();
+                                            Action::ChangeTransport(index)
+                                        };
+
+                                        if let Err(err) = tx.send(action) {
+                                            error!("could not send action: {err}");
                                         }
-                                        ctx.request_repaint();
                                     });
                                 } else {
                                     self.selected_transport_index = index;
@@ -424,29 +433,6 @@ impl eframe::App for SapodillaApp {
                         });
                     }
 
-                    if let Some(manager) = &self.transport_manager
-                        && ui.button("Test Send Data").clicked()
-                    {
-                        let data = vec![0u8; 1024 * 20];
-                        let manager = manager.clone();
-                        let tx = self.tx.clone();
-                        let ctx = ctx.clone();
-                        self.send_progress = None;
-
-                        spawn(async move {
-                            manager
-                                .send_data(12, &data, |total, sent| {
-                                    debug!(total, sent, "finished packet");
-                                    let _ =
-                                        tx.send(Action::SendProgress(sent as f32 / total as f32));
-                                    ctx.request_repaint();
-                                })
-                                .await
-                                .unwrap();
-                            info!("finished sending data");
-                        });
-                    }
-
                     ui.separator();
 
                     if ui.button("Export Canvas").clicked() {
@@ -480,7 +466,7 @@ impl eframe::App for SapodillaApp {
         egui::SidePanel::right("control_panel")
             .resizable(true)
             .default_width(350.0)
-            .width_range(200.0..=400.0)
+            .width_range(150.0..=400.0)
             .show(ctx, |ui| {
                 ui.heading("Device");
 
@@ -489,31 +475,27 @@ impl eframe::App for SapodillaApp {
                         if ui.button("Disconnect").clicked()
                             && let Some(manager) = self.transport_manager.take()
                         {
-                            self.transport_status = TransportStatus::Disconnecting;
-
                             let tx = self.tx.clone();
-                            let ctx = ctx.clone();
                             spawn(async move {
                                 if let Err(err) = manager.disconnect().await {
                                     tx.send(Action::Error(err)).unwrap();
-                                    ctx.request_repaint();
                                 }
                             });
                         }
 
                         if let Some(status) = &self.device_status {
                             ui.horizontal(|ui| {
-                                ui.label("state: ");
+                                ui.label("State: ");
                                 ui.label(serde_plain::to_string(&status.0).unwrap());
                             });
 
                             ui.horizontal(|ui| {
-                                ui.label("sub state: ");
+                                ui.label("Sub State: ");
                                 ui.label(serde_plain::to_string(&status.1).unwrap());
                             });
 
                             ui.horizontal(|ui| {
-                                ui.label("alerts: ");
+                                ui.label("Alerts: ");
                                 ui.label(&status.2);
                             });
                         }
@@ -529,7 +511,6 @@ impl eframe::App for SapodillaApp {
 
                                 let manager = self.transport_manager.clone().unwrap();
                                 let tx = self.tx.clone();
-                                let ctx = ctx.clone();
                                 self.send_progress = None;
 
                                 let hash = sha1::Sha1::digest(&buf);
@@ -585,11 +566,10 @@ impl eframe::App for SapodillaApp {
 
                                     manager
                                         .send_data(job_id, &buf, |total, sent| {
-                                            debug!(total, sent, "finished packet");
+                                            debug!(total, sent, "sent data packet");
                                             let _ = tx.send(Action::SendProgress(
                                                 sent as f32 / total as f32,
                                             ));
-                                            ctx.request_repaint();
                                         })
                                         .await
                                         .unwrap();
@@ -601,7 +581,7 @@ impl eframe::App for SapodillaApp {
                         } else {
                             if let Some(send_progress) = self.send_progress {
                                 ui.horizontal(|ui| {
-                                    ui.label("send progress: ");
+                                    ui.label("Data transfer: ");
                                     ui.add(
                                         egui::ProgressBar::new(send_progress)
                                             .show_percentage()
@@ -612,14 +592,14 @@ impl eframe::App for SapodillaApp {
 
                             if let Some(status) = &self.job_status {
                                 ui.horizontal(|ui| {
-                                    ui.label("state: ");
-                                    ui.label(serde_plain::to_string(&status.job_state).unwrap());
+                                    ui.label("State: ");
+                                    ui.label(serde_plain::to_string(&status.job_state).unwrap_or_default());
                                 });
 
                                 ui.horizontal(|ui| {
-                                    ui.label("sub state: ");
+                                    ui.label("Sub State: ");
                                     ui.label(
-                                        serde_plain::to_string(&status.job_sub_state).unwrap(),
+                                        serde_plain::to_string(&status.job_sub_state).unwrap_or_default(),
                                     );
                                 });
                             }
@@ -642,17 +622,14 @@ impl eframe::App for SapodillaApp {
                     TransportStatus::Disconnected => {
                         if ui.button("Connect").clicked() {
                             let tx = self.tx.clone();
-                            let ctx = ctx.clone();
 
                             let manager = TransportManager::new(
                                 self.get_transport(),
-                                Some(move |event: TransportEvent| {
+                                move |event| {
                                     if let Err(err) = tx.send(Action::TransportEvent(event)) {
                                         error!("could not send transport event: {err}");
                                     }
-
-                                    ctx.request_repaint();
-                                }),
+                                },
                             );
 
                             self.transport_manager = Some(manager);

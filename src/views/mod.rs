@@ -1,14 +1,47 @@
 use std::{collections::VecDeque, io::Cursor};
 
 use egui::{Id, Modal, Ui, Vec2};
-use egui_extras::{Column, TableBuilder};
+use egui_extras::{
+    Column, TableBuilder,
+    syntax_highlighting::{CodeTheme, code_view_ui},
+};
 use tracing::debug;
 
 use crate::{
-    app::Action,
-    protocol::{self, AvocadoPacket, AvocadoPacketReader, ProtocolError},
+    app::{Action, ContextSender},
+    protocol::{self, AvocadoId, AvocadoPacket, AvocadoPacketReader, ProtocolError},
     spawn,
 };
+
+pub fn pretty_hex(id: impl std::hash::Hash, ui: &mut Ui, data: &[u8]) {
+    const SECTIONS_PER_LINE: usize = 4;
+    const CHARS_PER_SECTION: usize = 4;
+
+    let default_spacing = ui.ctx().style().spacing.item_spacing;
+
+    egui::Grid::new(id)
+        .spacing(Vec2 {
+            x: default_spacing.x * 2.0,
+            ..default_spacing
+        })
+        .show(ui, |ui| {
+            for row in data.chunks(SECTIONS_PER_LINE * CHARS_PER_SECTION) {
+                ui.horizontal(|ui| {
+                    for chunk in row.chunks(CHARS_PER_SECTION) {
+                        ui.monospace(hex::encode_upper(chunk));
+                    }
+                });
+
+                // Only display directly visible characters, control characters
+                // and newlines would be a problem.
+                ui.monospace(
+                    String::from_utf8_lossy(row).replace(|c| !(' '..='~').contains(&c), " "),
+                );
+
+                ui.end_row();
+            }
+        });
+}
 
 pub fn protocol_packets_table(
     ui: &mut Ui,
@@ -18,48 +51,28 @@ pub fn protocol_packets_table(
     TableBuilder::new(ui)
         .auto_shrink(false)
         .striped(true)
-        .columns(Column::auto().resizable(true), 9)
+        .columns(Column::auto().resizable(true), 10)
         .column(Column::remainder().resizable(true))
         .header(20.0, |mut header| {
-            header.col(|ui| {
-                ui.heading("Message ID");
-            });
+            const FIELDS: &[&str] = &[
+                "Message ID",
+                "Request ID",
+                "Content Type",
+                "Interaction Type",
+                "Encoding Type",
+                "Encryption Mode",
+                "Terminal ID",
+                "Message Number",
+                "Message Total",
+                "Subpackage",
+                "Data",
+            ];
 
-            header.col(|ui| {
-                ui.heading("Content Type");
-            });
-
-            header.col(|ui| {
-                ui.heading("Interaction Type");
-            });
-
-            header.col(|ui| {
-                ui.heading("Encoding Type");
-            });
-
-            header.col(|ui| {
-                ui.heading("Encryption Mode");
-            });
-
-            header.col(|ui| {
-                ui.heading("Terminal ID");
-            });
-
-            header.col(|ui| {
-                ui.heading("Message Number");
-            });
-
-            header.col(|ui| {
-                ui.heading("Message Total");
-            });
-
-            header.col(|ui| {
-                ui.heading("Subpackage");
-            });
-
-            header.col(|ui| {
-                ui.heading("Data");
-            });
+            for field in FIELDS {
+                header.col(|ui| {
+                    ui.heading(*field);
+                });
+            }
         })
         .body(|body| {
             body.rows(20.0, packets.len(), |mut row| {
@@ -67,6 +80,15 @@ pub fn protocol_packets_table(
 
                 row.col(|ui| {
                     ui.label(packet.msg_number.to_string());
+                });
+
+                row.col(|ui| {
+                    ui.label(
+                        packet
+                            .as_json::<AvocadoId>()
+                            .map(|result| result.id.to_string())
+                            .unwrap_or_default(),
+                    );
                 });
 
                 row.col(|ui| {
@@ -102,12 +124,13 @@ pub fn protocol_packets_table(
                 });
 
                 row.col(|ui| {
-                    if ui
-                        .button(format!("view {} bytes", packet.data.len()))
-                        .clicked()
-                    {
-                        *viewing_packet = Some(packet.clone());
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} bytes", packet.data.len()));
+                        ui.add_space(8.0);
+                        if ui.button("View").clicked() {
+                            *viewing_packet = Some(packet.clone());
+                        }
+                    });
                 });
             });
         });
@@ -117,17 +140,16 @@ pub fn protocol_packets_table(
             ui.set_width(380.0);
             ui.heading("Viewing Packet Data");
 
-            pretty_hex(ui, &packet.data);
+            pretty_hex(format!("packet-{}", packet.msg_number), ui, &packet.data);
 
             ui.separator();
 
             if let Some(data) = packet.as_json::<serde_json::Value>() {
-                let theme =
-                    egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-                egui_extras::syntax_highlighting::code_view_ui(
+                let theme = CodeTheme::from_memory(ui.ctx(), ui.style());
+                code_view_ui(
                     ui,
                     &theme,
-                    &serde_json::to_string_pretty(&data).unwrap(),
+                    &serde_json::to_string_pretty(&data).unwrap_or_default(),
                     "json",
                 );
             };
@@ -143,34 +165,9 @@ pub fn protocol_packets_table(
     }
 }
 
-pub fn pretty_hex(ui: &mut Ui, data: &[u8]) {
-    let default_spacing = ui.ctx().style().spacing.item_spacing;
-
-    egui::Grid::new("hex_grid")
-        .spacing(Vec2 {
-            x: default_spacing.x * 2.0,
-            ..default_spacing
-        })
-        .show(ui, |ui| {
-            for row in data.chunks(4 * 4) {
-                ui.horizontal(|ui| {
-                    for chunk in row.chunks(4) {
-                        ui.monospace(hex::encode_upper(chunk));
-                    }
-                });
-
-                ui.monospace(
-                    String::from_utf8_lossy(row).replace(|c| !(' '..='~').contains(&c), " "),
-                );
-
-                ui.end_row();
-            }
-        });
-}
-
 pub fn packet_debug(
     ctx: &egui::Context,
-    tx: &std::sync::mpsc::Sender<Action>,
+    tx: &ContextSender<Action>,
     show: &mut bool,
     packets: &Option<Result<Vec<AvocadoPacket>, ProtocolError>>,
 ) {
@@ -199,8 +196,8 @@ pub fn packet_debug(
                         let cursor = Cursor::new(data);
                         let avocado_packets: Result<Vec<_>, _> =
                             AvocadoPacketReader::new(cursor).collect();
-                        tx.send(Action::LoadedAvocadoPackets(avocado_packets))
-                            .unwrap();
+
+                        let _ = tx.send(Action::LoadedAvocadoPackets(avocado_packets));
                         ctx.request_repaint();
                     }
                 });
@@ -208,37 +205,10 @@ pub fn packet_debug(
 
             match packets {
                 Some(Ok(packets)) => {
+                    let has_exactly_one = packets.len() == 1;
+
                     for (index, packet) in packets.iter().enumerate() {
-                        egui::CollapsingHeader::new(format!("Packet {}", index + 1))
-                            .default_open(packets.len() == 1)
-                            .show(ui, |ui| {
-                                let theme =
-                                    egui_extras::syntax_highlighting::CodeTheme::from_memory(
-                                        ui.ctx(),
-                                        ui.style(),
-                                    );
-                                egui_extras::syntax_highlighting::code_view_ui(
-                                    ui,
-                                    &theme,
-                                    &serde_json::to_string_pretty(packet).unwrap(),
-                                    "json",
-                                );
-
-                                ui.separator();
-                                ui.heading("Packet Data - Hex");
-                                pretty_hex(ui, &packet.data);
-
-                                if let Some(data) = packet.as_json::<serde_json::Value>() {
-                                    ui.separator();
-                                    ui.heading("Packet Data - JSON");
-                                    egui_extras::syntax_highlighting::code_view_ui(
-                                        ui,
-                                        &theme,
-                                        &serde_json::to_string_pretty(&data).unwrap(),
-                                        "json",
-                                    );
-                                }
-                            });
+                        packet_details(ui, has_exactly_one, index, packet);
                     }
                 }
                 Some(Err(err)) => {
@@ -247,6 +217,35 @@ pub fn packet_debug(
                 None => {
                     ui.label("No packets loaded");
                 }
+            }
+        });
+}
+
+fn packet_details(ui: &mut Ui, has_exactly_one: bool, index: usize, packet: &AvocadoPacket) {
+    egui::CollapsingHeader::new(format!("Packet {}", index + 1))
+        .default_open(has_exactly_one)
+        .show(ui, |ui| {
+            let theme = CodeTheme::from_memory(ui.ctx(), ui.style());
+            ui.style_mut().spacing.item_spacing = Vec2::new(8.0, 16.0);
+
+            code_view_ui(
+                ui,
+                &theme,
+                &serde_json::to_string_pretty(packet).unwrap_or_default(),
+                "json",
+            );
+
+            ui.heading("Packet Data (hex)");
+            pretty_hex(format!("packet-{index}"), ui, &packet.data);
+
+            if let Some(data) = packet.as_json::<serde_json::Value>() {
+                ui.heading("Packet Data (json)");
+                code_view_ui(
+                    ui,
+                    &theme,
+                    &serde_json::to_string_pretty(&data).unwrap_or_default(),
+                    "json",
+                );
             }
         });
 }

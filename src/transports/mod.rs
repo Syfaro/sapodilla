@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -10,27 +11,31 @@ use futures::{
     channel::{mpsc, oneshot},
     lock::Mutex,
 };
-use serde::Deserialize;
 use tracing::{debug, error, info, instrument, trace, warn};
 
-use crate::protocol::{
-    AvocadoPacket, ContentType, EncodingType, EncryptionMode, InteractionType, JobState,
-    JobStatusInfo, PrinterState, PrinterSubState,
-};
+use crate::protocol::*;
 
 use crate::transports::mock::MockTransport;
 #[cfg(target_arch = "wasm32")]
 use crate::transports::web_serial::WebSerialTransport;
-use crate::{Rc, spawn};
+use crate::{Rc, interval, spawn};
 
 pub mod mock;
 #[cfg(target_arch = "wasm32")]
 pub mod web_serial;
 
+/// Static message ID to ensure we never reuse an ID, even across different
+/// transport instances. Generally accessed through
+/// [`TransportManager::next_message_id`].
 static MESSAGE_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Maximum size of data within a message.
 pub const MAX_DATA_SIZE: usize = 896;
 
+/// A transport for sending packet data.
+///
+/// You should construct a [`TransportManager`] from this `Transport` rather
+/// than trying to use it directly.
 #[enum_dispatch(TransportControl)]
 #[derive(strum::EnumIter)]
 pub enum Transport {
@@ -39,22 +44,34 @@ pub enum Transport {
     MockTransport,
 }
 
+/// Information about a discovered device.
 #[allow(dead_code)]
 pub struct DiscoveredDevice {
+    /// The primary name of the device.
     pub name: String,
+    /// An optional detail string about the device.
     pub details: Option<String>,
 }
 
+/// An event from the [`TransportManager`].
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum TransportEvent {
+    /// Sent when the transport is connecting, disconnected, etc.
     TransportStatus(TransportStatus),
+    /// Info about the status of the device, automatically fetched every few
+    /// seconds when the transport is not sending large data.
     DeviceStatus((PrinterState, PrinterSubState, String)),
-    JobStatus((u32, JobStatusInfo)),
+    /// Info about a job, sent after calling [`TransportManager::poll_job`]
+    /// until the job reaches a terminal state.
+    JobStatus(JobStatusInfo),
+    /// Sent for all received packets.
     Packet(AvocadoPacket),
+    /// An error from the transport.
     Error(anyhow::Error),
 }
 
+/// The transport's current device connection status.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub enum TransportStatus {
@@ -88,6 +105,8 @@ pub trait TransportControl {
     -> anyhow::Result<oneshot::Receiver<()>>;
 }
 
+/// A wrapper around a transport to add needed functions such as waiting for the
+/// result of a package and handling background status updates.
 #[derive(Clone)]
 pub struct TransportManager {
     transport: Rc<Mutex<Transport>>,
@@ -97,18 +116,12 @@ pub struct TransportManager {
     pending: Rc<Mutex<HashMap<u32, oneshot::Sender<AvocadoPacket>>>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResultWithId {
-    id: u32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AvocadoResult<T> {
-    pub result: T,
-}
-
 impl TransportManager {
-    pub fn new<F>(transport: Rc<Mutex<Transport>>, cb: Option<F>) -> Rc<Self>
+    /// Create a new manager for a given transport.
+    ///
+    /// Handles starting the transport, polling device status, and attaching
+    /// incoming packets to waiting requests.
+    pub fn new<F>(transport: Rc<Mutex<Transport>>, cb: F) -> Rc<Self>
     where
         F: Fn(TransportEvent) + Send + Sync + 'static,
     {
@@ -136,16 +149,10 @@ impl TransportManager {
                     return;
                 }
 
-                #[cfg(target_arch = "wasm32")]
-                let mut stream = gloo_timers::future::IntervalStream::new(1_000);
-                #[cfg(not(target_arch = "wasm32"))]
-                let mut stream = tokio_stream::wrappers::IntervalStream::new(
-                    tokio::time::interval(std::time::Duration::from_secs(1)),
-                );
+                info!("connection marked as ready, starting info polling");
 
+                let mut stream = interval(Duration::from_secs(1));
                 while stream.next().await.is_some() {
-                    info!("making status request");
-
                     if event_tx.is_closed() {
                         warn!("event sender was closed, ending status stream");
                         break;
@@ -179,6 +186,7 @@ impl TransportManager {
                         }))
                         .unwrap(),
                     };
+                    trace!(?packet, "prepared get-prop request");
 
                     let packet = match manager.wait_for_response(packet).await {
                         Ok(packet) => packet,
@@ -187,11 +195,13 @@ impl TransportManager {
                             break;
                         }
                     };
+                    trace!(?packet, "got get-prop response");
 
                     if let Some(result) =
                         packet.as_json::<AvocadoResult<(PrinterState, PrinterSubState, String)>>()
                     {
-                        info!("got status: {result:?}");
+                        debug!("got status: {:?}", result.result);
+
                         if let Err(err) = event_tx
                             .send(TransportEvent::DeviceStatus(result.result))
                             .await
@@ -214,11 +224,16 @@ impl TransportManager {
             while let Some(event) = event_rx.next().await {
                 match &event {
                     TransportEvent::Packet(packet) => {
-                        if let Some(data) = packet.as_json::<ResultWithId>()
-                            && let Some(pending) = pending.lock().await.remove(&data.id)
-                            && pending.send(packet.clone()).is_err()
+                        if let Some(data) = packet.as_json::<AvocadoId>() {
+                            if let Some(pending) = pending.lock().await.remove(&data.id)
+                                && pending.send(packet.clone()).is_err()
+                            {
+                                error!("could not send packet to pending");
+                            }
+                        } else if packet.content_type == ContentType::Message
+                            && packet.encoding_type == EncodingType::Json
                         {
-                            error!("could not send packet to pending");
+                            warn!("got json message without id");
                         }
                     }
                     TransportEvent::TransportStatus(TransportStatus::Connected) => {
@@ -229,9 +244,7 @@ impl TransportManager {
                     _ => trace!("got other event: {event:?}"),
                 }
 
-                if let Some(cb) = &cb {
-                    cb(event);
-                }
+                cb(event);
             }
         });
 
@@ -247,21 +260,33 @@ impl TransportManager {
         manager
     }
 
+    /// Disconnect transport.
     pub async fn disconnect(&self) -> anyhow::Result<()> {
         info!("disconnecting transport");
+        self.event_tx
+            .clone()
+            .send(TransportEvent::TransportStatus(
+                TransportStatus::Disconnecting,
+            ))
+            .await?;
         self.transport.lock().await.disconnect().await
     }
 
+    /// Get the next message ID.
     pub fn next_message_id(&self) -> u32 {
         let id = MESSAGE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         trace!(id, "generated next message id");
         id
     }
 
+    /// Send a packet and wait for the resulting packet.
+    ///
+    /// This does not have a timeout.
+    #[instrument(skip_all, fields(msg_number = packet.msg_number))]
     pub async fn wait_for_response(&self, packet: AvocadoPacket) -> anyhow::Result<AvocadoPacket> {
         let (tx, rx) = oneshot::channel();
 
-        debug!(id = packet.msg_number, "sending and awaiting packet");
+        debug!("sending packet");
         self.pending.lock().await.insert(packet.msg_number, tx);
         self.transport
             .lock()
@@ -269,24 +294,21 @@ impl TransportManager {
             .send_packet(packet)
             .await?
             .await?;
+        trace!("packet marked as sent");
 
         rx.await.map_err(Into::into)
     }
 
+    /// Poll a job for status updates.
+    ///
+    /// Updates are sent through the manager's event stream. This method returns
+    /// after the job has reached a terminal state.
     #[instrument(skip(self))]
     pub async fn poll_job(&self, job_id: u32) -> anyhow::Result<()> {
-        #[cfg(target_arch = "wasm32")]
-        let mut stream = gloo_timers::future::IntervalStream::new(1_000);
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut stream = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
-            std::time::Duration::from_secs(1),
-        ));
-
         let mut event_tx = self.event_tx.clone();
 
+        let mut stream = interval(Duration::from_secs(1));
         while stream.next().await.is_some() {
-            info!("making job status request");
-
             if event_tx.is_closed() {
                 warn!("event sender was closed, ending job status stream");
                 break;
@@ -311,6 +333,7 @@ impl TransportManager {
                 }))
                 .unwrap(),
             };
+            trace!(?packet, "prepared get-job-info request");
 
             let packet = match self.wait_for_response(packet).await {
                 Ok(packet) => packet,
@@ -319,9 +342,11 @@ impl TransportManager {
                     break;
                 }
             };
+            trace!(?packet, "got get-job-info response");
 
             if let Some(mut result) = packet.as_json::<AvocadoResult<Vec<JobStatusInfo>>>() {
-                info!("got job status: {result:?}");
+                debug!("got get-job-info info: {:?}", result.result);
+
                 let Some(info) = result.result.pop() else {
                     warn!("result was missing job info");
                     continue;
@@ -332,10 +357,7 @@ impl TransportManager {
                     JobState::Aborted | JobState::Cancelled | JobState::Completed
                 );
 
-                if let Err(err) = event_tx
-                    .send(TransportEvent::JobStatus((job_id, info)))
-                    .await
-                {
+                if let Err(err) = event_tx.send(TransportEvent::JobStatus(info)).await {
                     error!("could not send job status: {err:?}");
                     break;
                 }
@@ -356,27 +378,22 @@ impl TransportManager {
         Ok(())
     }
 
+    /// Send binary data to the device for a given job.
+    ///
+    /// Will return an error if data is already being sent.
     #[instrument(skip(self, data, f))]
     pub async fn send_data<F>(&self, job_id: u32, data: &[u8], f: F) -> anyhow::Result<()>
     where
         F: Fn(usize, usize),
     {
-        if self.sending.load(std::sync::atomic::Ordering::SeqCst) {
+        let Some(_guard) = SendingDropGuard::new(self.sending.clone()) else {
             bail!("cannot start sending data while other send is in progress");
-        }
+        };
 
         let count = usize::div_ceil(data.len(), MAX_DATA_SIZE - 4);
-        debug!(
-            chunk_count = count,
-            "sending data with {} bytes",
-            data.len()
-        );
-
-        let _guard = SendingDropGuard::new(self.sending.clone());
+        debug!(chunks = count, "sending data with {} bytes", data.len());
 
         for (index, chunk) in data.chunks(MAX_DATA_SIZE - 4).enumerate() {
-            debug!(index, "sending packet");
-
             let mut buf: Vec<u8> = Vec::with_capacity(MAX_DATA_SIZE);
             buf.extend(&job_id.to_le_bytes());
             buf.extend_from_slice(chunk);
@@ -395,13 +412,17 @@ impl TransportManager {
                 is_subpackage: count > 1,
                 data: buf,
             };
+            trace!(index, ?packet, "sending data packet");
 
+            // Make sure we're waiting for the internal write to happen before
+            // we attempt to write the next packet in this package.
             self.transport
                 .lock()
                 .await
                 .send_packet(packet)
                 .await?
                 .await?;
+
             f(count, index + 1);
         }
 
@@ -409,15 +430,23 @@ impl TransportManager {
     }
 }
 
+/// Helper to set and remove the sending flag in a [`TransportManager`].
+///
+/// Automatically marks it as sending upon creation and unmarks it when dropped.
 struct SendingDropGuard {
     sending: Rc<AtomicBool>,
 }
 
 impl SendingDropGuard {
-    fn new(sending: Rc<AtomicBool>) -> Self {
+    /// Create a new guard, if the sending flag was not already set.
+    fn new(sending: Rc<AtomicBool>) -> Option<Self> {
+        if sending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            warn!("attempted to create sending guard when already sending");
+            return None;
+        }
+
         trace!("marking as sending");
-        sending.store(true, std::sync::atomic::Ordering::SeqCst);
-        Self { sending }
+        Some(Self { sending })
     }
 }
 

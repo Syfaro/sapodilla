@@ -11,11 +11,9 @@ use web_sys::{
     ReadableStreamDefaultReader, SerialOptions, SerialPort, WritableStreamDefaultWriter, js_sys,
 };
 
-use crate::protocol::AvocadoPacket;
-use crate::transports::TransportStatus;
 use crate::{
-    protocol,
-    transports::{TransportControl, TransportEvent},
+    protocol::{self, AvocadoPacket},
+    transports::{TransportControl, TransportEvent, TransportStatus},
 };
 
 #[derive(Debug)]
@@ -87,7 +85,6 @@ impl TransportControl for WebSerialTransport {
         };
 
         tx.send(TransportAction::Disconnect).await?;
-
         Ok(())
     }
 
@@ -100,10 +97,8 @@ impl TransportControl for WebSerialTransport {
         };
 
         let (send_tx, send_rx) = futures::channel::oneshot::channel();
-
         tx.send(TransportAction::SendPacket((packet, send_tx)))
             .await?;
-
         Ok(send_rx)
     }
 }

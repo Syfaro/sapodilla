@@ -383,6 +383,16 @@ impl_de_str_primitive!(JobSubState);
 impl_de_str_primitive!(PrinterState);
 impl_de_str_primitive!(PrinterSubState);
 
+#[derive(Debug, Deserialize)]
+pub struct AvocadoId {
+    pub id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AvocadoResult<T> {
+    pub result: T,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
