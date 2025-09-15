@@ -1,11 +1,36 @@
 # Sapodilla
 
-Work in progress! Attempting to make an alternative interface for the PixCut S1.
+> [!WARNING]
+> This project is a work in progress. Features may not work as expected and
+> could potentially harm your device. Use with caution.
+
+An alternative interface for the PixCut S1.
+
+## Usage
+
+This is currently designed to be run in Chrome via WebAssembly. You can access
+the latest version [here](https://sapodilla.pages.dev).
+
+### Features
+
+- [x] Connect to device
+- [x] Get status updates from device
+- [ ] Canvas Editor
+    - [x] Image upload
+    - [x] Image placement
+    - [ ] Image scaling
+    - [ ] Image rotation
+    - [ ] Image layers
+    - [ ] Image alignment
+    - [ ] Upload format supporting cut marks
+    - [ ] Cut mark preview
+    - [ ] Cut mark generation (stretch goal)
+- [ ] Photo Printing
+    - [x] Single print job
+    - [ ] Set number of copies
+- [ ] Sticker Cutting and Printing
+    - [ ] Print and cut job
 
 ## Protocol
 
 Protocol documentation can be found [here](protocol.md).
-
-## Using
-
-This is currently designed to be run in Chrome by building for WebAssembly.

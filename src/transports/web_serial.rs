@@ -4,14 +4,14 @@ use std::io::Cursor;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use eframe::wasm_bindgen::{JsCast, JsValue};
-use futures::channel::mpsc;
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt, channel::mpsc};
 use tracing::{debug, error, info, trace, warn};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStreamDefaultReader, SerialOptions, SerialPort, WritableStreamDefaultWriter, js_sys,
 };
 
+use crate::protocol::AvocadoPacket;
 use crate::transports::TransportStatus;
 use crate::{
     protocol,
@@ -20,7 +20,12 @@ use crate::{
 
 #[derive(Debug)]
 enum TransportAction {
-    SendPacket(protocol::AvocadoPacket),
+    SendPacket(
+        (
+            protocol::AvocadoPacket,
+            futures::channel::oneshot::Sender<()>,
+        ),
+    ),
     Disconnect,
 }
 
@@ -49,7 +54,7 @@ impl TransportControl for WebSerialTransport {
         }
 
         event_tx
-            .send(TransportEvent::StatusChange(TransportStatus::Connecting))
+            .send(TransportEvent::TransportStatus(TransportStatus::Connecting))
             .await?;
 
         let serial = navigator.serial();
@@ -66,7 +71,7 @@ impl TransportControl for WebSerialTransport {
             .map_err(|err| anyhow!("could not open port: {err:?}"))?;
 
         event_tx
-            .send(TransportEvent::StatusChange(TransportStatus::Connected))
+            .send(TransportEvent::TransportStatus(TransportStatus::Connected))
             .await?;
 
         WebSerialHandler::start(port.to_owned(), action_rx, event_tx);
@@ -86,14 +91,20 @@ impl TransportControl for WebSerialTransport {
         Ok(())
     }
 
-    async fn send_packet(&mut self, packet: protocol::AvocadoPacket) -> Result<(), anyhow::Error> {
+    async fn send_packet(
+        &mut self,
+        packet: AvocadoPacket,
+    ) -> anyhow::Result<futures::channel::oneshot::Receiver<()>> {
         let Some(tx) = self.tx.as_mut() else {
             bail!("transport was not started");
         };
 
-        tx.send(TransportAction::SendPacket(packet)).await?;
+        let (send_tx, send_rx) = futures::channel::oneshot::channel();
 
-        Ok(())
+        tx.send(TransportAction::SendPacket((packet, send_tx)))
+            .await?;
+
+        Ok(send_rx)
     }
 }
 
@@ -167,7 +178,9 @@ impl WebSerialHandler {
 
         let _ = self
             .event_tx
-            .send(TransportEvent::StatusChange(TransportStatus::Disconnected))
+            .send(TransportEvent::TransportStatus(
+                TransportStatus::Disconnected,
+            ))
             .await;
 
         info!("web serial handler stopped");
@@ -182,18 +195,20 @@ impl WebSerialHandler {
             debug!("got action: {action:?}");
 
             match action {
-                TransportAction::SendPacket(packet) => {
+                TransportAction::SendPacket((packet, tx)) => {
                     let data = packet.encode();
                     let data = js_sys::Uint8Array::new_from_slice(&data);
 
                     JsFuture::from(writer.write_with_chunk(&data))
                         .await
                         .map_err(|err| anyhow!("could not write chunk: {err:?}"))?;
+
+                    if tx.send(()).is_err() {
+                        error!("could not send message completion");
+                    }
                 }
 
                 TransportAction::Disconnect => {
-                    writer.release_lock();
-
                     if let Err(err) = stop_tx.send(()) {
                         error!("could not send disconnect event to stop channel: {err}");
                     }

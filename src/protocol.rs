@@ -45,15 +45,27 @@ impl AvocadoPacket {
     }
 }
 
-#[derive(PackedStruct, Debug, PartialEq)]
-#[packed_struct(bit_numbering = "msb0", size_bytes = "2")]
-struct AvocadoFlags {
-    #[packed_field(bits = "0..=9", endian = "lsb")]
-    length: u16,
-    #[packed_field(bits = "10")]
-    is_subpackage: bool,
-    #[packed_field(bits = "11..=13", ty = "enum")]
-    encryption_mode: EncryptionMode,
+#[derive(Debug)]
+pub struct AvocadoFlags {
+    pub length: u16,
+    pub is_subpackage: bool,
+    pub encryption_mode: EncryptionMode,
+}
+
+impl AvocadoFlags {
+    pub fn unpack(flags: u16) -> Option<Self> {
+        let is_subpackage = ((flags & 0b00100000_00000000) >> 13) > 0;
+        let encryption_mode = EncryptionMode::from_primitive(
+            u8::try_from((flags & 0b00011100_00000000) >> 10).unwrap(),
+        )?;
+        let length = flags & 0b00000011_11111111;
+
+        Some(AvocadoFlags {
+            length,
+            is_subpackage,
+            encryption_mode,
+        })
+    }
 }
 
 impl AvocadoPacket {
@@ -99,8 +111,8 @@ impl AvocadoPacket {
             .map_err(ProtocolError::Reader)?;
         trace!("flags: {flags:016b}");
 
-        let flags = AvocadoFlags::unpack_from_slice(&flags.to_le_bytes())
-            .map_err(|_| ProtocolError::InvalidData("flags"))?;
+        let flags = AvocadoFlags::unpack(flags).ok_or(ProtocolError::InvalidData("flags"))?;
+        trace!(?flags);
 
         let mut data = vec![0u8; usize::from(flags.length)];
         reader
@@ -260,7 +272,7 @@ impl std::fmt::Display for EncryptionMode {
     }
 }
 
-#[derive(PrimitiveEnum_u8, Clone, Copy, Debug, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(PrimitiveEnum_u8, Clone, Copy, Debug, PartialEq, Hash, Serialize)]
 pub enum JobState {
     Waiting = 1,
     Start = 2,
@@ -273,7 +285,7 @@ pub enum JobState {
     Completed = 9,
 }
 
-#[derive(PrimitiveEnum_u16, Clone, Copy, Debug, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(PrimitiveEnum_u16, Clone, Copy, Debug, PartialEq, Hash, Serialize)]
 pub enum JobSubState {
     WaitingNone = 1000,
     StartNone = 2000,
@@ -289,6 +301,106 @@ pub enum JobSubState {
     AbortedNone = 7000,
     CancelledNone = 8000,
     CompletedNone = 9000,
+}
+
+#[derive(PrimitiveEnum_u8, Clone, Copy, Debug, PartialEq, Hash, Serialize)]
+pub enum PrinterState {
+    Initializing = 10,
+    Idle = 20,
+    Sleep = 30,
+    Processing = 40,
+    Off = 50,
+    Error = 60,
+}
+
+#[derive(PrimitiveEnum_u16, Clone, Copy, Debug, PartialEq, Hash, Serialize)]
+pub enum PrinterSubState {
+    InitNone = 1000,
+    IdleNone = 2000,
+    Printing = 3001,
+    FileTransferring = 3002,
+    Cancelling = 3006,
+    Upgrading = 3007,
+    Calibrating = 3008,
+    SemiAutoPrinting = 3009,
+    SemiAutoScanRequired = 3010,
+    SemiAutoScanning = 3011,
+    ScanWaiting = 3012,
+    CopyWaiting = 3013,
+    Rendering = 3014,
+    Initializing = 3015,
+    Decoding = 3016,
+    LoadingPaper = 3017,
+    PrintingYellow = 3018,
+    PrintingMagenta = 3019,
+    PrintingCyan = 3020,
+    PrintingOC = 3021,
+    Preheating = 3022,
+    Cooldown = 3023,
+    Cleaning = 3024,
+    HomeFeed = 3025,
+    EjectingPaper = 3026,
+    SmartSheet = 3027,
+    CutPick = 3028,
+    CutHome = 3029,
+    Cutting = 3030,
+    CutEject = 3031,
+    Normal = 4002,
+    NotRealOff = 5002,
+    ErrorNone = 6000,
+}
+
+macro_rules! impl_de_str_primitive {
+    ($t:ty) => {
+        impl<'de> serde::Deserialize<'de> for $t {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum StrOrPrimitive {
+                    Str(String),
+                    Primitive(<$t as PrimitiveEnum>::Primitive),
+                }
+
+                let val = match StrOrPrimitive::deserialize(deserializer)? {
+                    StrOrPrimitive::Str(s) => s
+                        .parse()
+                        .map_err(|_| serde::de::Error::custom("value was not primitive"))?,
+                    StrOrPrimitive::Primitive(val) => val,
+                };
+
+                <$t>::from_primitive(val)
+                    .ok_or_else(|| serde::de::Error::custom("value was not valid for primitive"))
+            }
+        }
+    };
+}
+
+impl_de_str_primitive!(JobState);
+impl_de_str_primitive!(JobSubState);
+impl_de_str_primitive!(PrinterState);
+impl_de_str_primitive!(PrinterSubState);
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct JobStatusInfo {
+    pub job_id: u32,
+    pub job_state: JobState,
+    pub job_sub_state: JobSubState,
+    pub copies: u8,
+    pub printing_page_number: u8,
+    pub user_account: String,
+    pub channel: u32,
+    pub media_size: u32,
+    pub media_type: u32,
+    pub job_type: u32,
+    pub document_format: u32,
+    pub file_size: u32,
+    pub transfer_status: u32,
+    pub transfer_size: u32,
 }
 
 #[cfg(test)]
@@ -315,58 +427,6 @@ mod tests {
 
         let packet = AvocadoPacket::read_one(&mut cursor);
         assert!(packet.is_ok());
-    }
-
-    #[test]
-    fn test_flags() {
-        let flags = AvocadoFlags {
-            is_subpackage: false,
-            encryption_mode: EncryptionMode::None,
-            length: 1,
-        }
-        .pack()
-        .unwrap();
-        assert_eq!(flags, [0b00000001, 0b00000000]);
-
-        let flags = AvocadoFlags {
-            is_subpackage: false,
-            encryption_mode: EncryptionMode::RC4,
-            length: 1,
-        }
-        .pack()
-        .unwrap();
-        println!("{:08b} {:08b}", flags[0], flags[1]);
-        assert_eq!(flags, [0b00000001, 0b00001000]);
-
-        let flags = AvocadoFlags {
-            is_subpackage: true,
-            encryption_mode: EncryptionMode::RC4,
-            length: 1,
-        }
-        .pack()
-        .unwrap();
-        println!("{:08b} {:08b}", flags[0], flags[1]);
-        assert_eq!(flags, [0b00000001, 0b00101000]);
-
-        let flags = AvocadoFlags {
-            is_subpackage: true,
-            encryption_mode: EncryptionMode::RC4,
-            length: 255,
-        }
-        .pack()
-        .unwrap();
-        println!("{:08b} {:08b}", flags[0], flags[1]);
-        assert_eq!(flags, [0b11111111, 0b00101000]);
-
-        let flags = AvocadoFlags {
-            is_subpackage: true,
-            encryption_mode: EncryptionMode::RC4,
-            length: 1023,
-        }
-        .pack()
-        .unwrap();
-        println!("{:08b} {:08b}", flags[0], flags[1]);
-        assert_eq!(flags, [0b11111111, 0b11101000]);
     }
 
     #[test]

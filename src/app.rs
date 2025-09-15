@@ -3,15 +3,23 @@ use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
 use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2, emath};
 use futures::lock::Mutex;
 use image::{EncodableLayout, GenericImageView};
+use serde::Deserialize;
+use sha1::Digest;
 use strum::IntoEnumIterator;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 use crate::{
     Rc,
-    protocol::{AvocadoPacket, EncodingType, EncryptionMode, ProtocolError},
+    protocol::{
+        AvocadoPacket, EncodingType, EncryptionMode, JobStatusInfo, PrinterState, PrinterSubState,
+        ProtocolError,
+    },
     spawn,
-    transports::{Transport, TransportControl, TransportEvent, TransportManager, TransportStatus},
+    transports::{
+        AvocadoResult, Transport, TransportControl, TransportEvent, TransportManager,
+        TransportStatus,
+    },
     views,
 };
 
@@ -22,6 +30,7 @@ pub enum Action {
     TransportEvent(TransportEvent),
     LoadedAvocadoPackets(Result<Vec<AvocadoPacket>, ProtocolError>),
     LoadedImage(#[debug(skip)] anyhow::Result<LoadedImage>),
+    SendProgress(f32),
 }
 
 pub struct SapodillaApp {
@@ -32,8 +41,11 @@ pub struct SapodillaApp {
     transport_names: Vec<Cow<'static, str>>,
     selected_transport_index: usize,
 
-    transport_manager: Option<TransportManager>,
+    transport_manager: Option<Rc<TransportManager>>,
     transport_status: TransportStatus,
+    device_status: Option<(PrinterState, PrinterSubState, String)>,
+    job_status: Option<JobStatusInfo>,
+    send_progress: Option<f32>,
 
     packets: VecDeque<AvocadoPacket>,
     viewing_packet: Option<AvocadoPacket>,
@@ -183,6 +195,9 @@ impl Default for SapodillaApp {
 
             transport_status: TransportStatus::Disconnected,
             transport_manager: None,
+            device_status: None,
+            job_status: None,
+            send_progress: None,
 
             packets: Default::default(),
             viewing_packet: None,
@@ -235,8 +250,18 @@ impl eframe::App for SapodillaApp {
 
                         self.packets.push_front(packet);
                     }
-                    TransportEvent::StatusChange(status) => {
+                    TransportEvent::TransportStatus(status) => {
                         self.transport_status = status;
+
+                        if status == TransportStatus::Disconnecting {
+                            self.device_status = None;
+                        }
+                    }
+                    TransportEvent::DeviceStatus(status) => {
+                        self.device_status = Some(status);
+                    }
+                    TransportEvent::JobStatus((_, status)) => {
+                        self.job_status = Some(status);
                     }
                     TransportEvent::Error(err) => {
                         self.error = Some(err);
@@ -250,6 +275,9 @@ impl eframe::App for SapodillaApp {
                     }
                     Err(err) => self.error = Some(err),
                 },
+                Action::SendProgress(pct) => {
+                    self.send_progress = Some(pct);
+                }
             }
         }
 
@@ -293,12 +321,14 @@ impl eframe::App for SapodillaApp {
                                     self.transport_status = TransportStatus::Disconnecting;
 
                                     let tx = self.tx.clone();
+                                    let ctx = ctx.clone();
                                     spawn(async move {
                                         if let Err(err) = manager.disconnect().await {
                                             tx.send(Action::Error(err)).unwrap();
                                         } else {
                                             tx.send(Action::ChangeTransport(index)).unwrap();
                                         }
+                                        ctx.request_repaint();
                                     });
                                 } else {
                                     self.selected_transport_index = index;
@@ -315,29 +345,113 @@ impl eframe::App for SapodillaApp {
                         "Saved Packet Debugger",
                     );
 
+                    if let Some(manager) = &self.transport_manager
+                        && ui.button("Send Get Prop Packet").clicked()
+                    {
+                        let manager = manager.clone();
+                        let id = manager.next_message_id();
+
+                        spawn(async move {
+                            let packet = manager
+                                .wait_for_response(AvocadoPacket {
+                                    version: 100,
+                                    content_type: crate::protocol::ContentType::Message,
+                                    interaction_type: crate::protocol::InteractionType::Request,
+                                    encoding_type: EncodingType::Json,
+                                    encryption_mode: EncryptionMode::None,
+                                    terminal_id: id,
+                                    msg_number: id,
+                                    msg_package_total: 1,
+                                    msg_package_num: 1,
+                                    is_subpackage: false,
+                                    data: serde_json::to_vec(&serde_json::json!({
+                                        "id" : id,
+                                        "method" : "get-prop",
+                                        "params" : [
+                                            "model",
+                                            "mac-address",
+                                            "serial-number",
+                                            "sn-pcba",
+                                            "firmware-revision",
+                                            "hardware-revision",
+                                            "bt-phone-mac",
+                                            "printer-state",
+                                            "printer-sub-state",
+                                            "printer-state-alerts",
+                                            "auto-off-interval",
+                                            "media-size",
+                                        ]
+                                    }))
+                                    .unwrap(),
+                                })
+                                .await
+                                .unwrap();
+
+                            info!("got info packet: {packet:?}");
+                        });
+                    }
+
+                    if let Some(manager) = &self.transport_manager
+                        && ui.button("Send Resume Printer").clicked()
+                    {
+                        let manager = manager.clone();
+                        let id = manager.next_message_id();
+
+                        spawn(async move {
+                            let packet = manager
+                                .wait_for_response(AvocadoPacket {
+                                    version: 100,
+                                    content_type: crate::protocol::ContentType::Message,
+                                    interaction_type: crate::protocol::InteractionType::Request,
+                                    encoding_type: EncodingType::Json,
+                                    encryption_mode: EncryptionMode::None,
+                                    terminal_id: id,
+                                    msg_number: id,
+                                    msg_package_total: 1,
+                                    msg_package_num: 1,
+                                    is_subpackage: false,
+                                    data: serde_json::to_vec(&serde_json::json!({
+                                        "id" : id,
+                                        "method" : "resume-printer",
+                                        "params" : []
+                                    }))
+                                    .unwrap(),
+                                })
+                                .await
+                                .unwrap();
+
+                            info!("got resume packet: {packet:?}");
+                        });
+                    }
+
+                    if let Some(manager) = &self.transport_manager
+                        && ui.button("Test Send Data").clicked()
+                    {
+                        let data = vec![0u8; 1024 * 20];
+                        let manager = manager.clone();
+                        let tx = self.tx.clone();
+                        let ctx = ctx.clone();
+                        self.send_progress = None;
+
+                        spawn(async move {
+                            manager
+                                .send_data(12, &data, |total, sent| {
+                                    debug!(total, sent, "finished packet");
+                                    let _ =
+                                        tx.send(Action::SendProgress(sent as f32 / total as f32));
+                                    ctx.request_repaint();
+                                })
+                                .await
+                                .unwrap();
+                            info!("finished sending data");
+                        });
+                    }
+
                     ui.separator();
 
                     if ui.button("Export Canvas").clicked() {
                         let im = self.render_image();
-
-                        let mut buf = Vec::with_capacity(1024 * 1024);
-                        let mut quality = 100;
-                        loop {
-                            // Image needs to be under 1MB, so decrease quality
-                            // until we get there.
-                            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                                &mut buf, quality,
-                            );
-                            encoder.encode_image(&im).unwrap();
-                            debug!(quality, len = buf.len(), "got jpeg size");
-
-                            if buf.len() <= 1024 * 1024 || quality == 0 {
-                                break;
-                            }
-
-                            quality -= 1;
-                            buf.clear();
-                        }
+                        let buf = encode_image(&im);
 
                         spawn(async move {
                             let Some(handle) = rfd::AsyncFileDialog::new()
@@ -375,21 +489,57 @@ impl eframe::App for SapodillaApp {
                         if ui.button("Disconnect").clicked()
                             && let Some(manager) = self.transport_manager.take()
                         {
+                            self.transport_status = TransportStatus::Disconnecting;
+
                             let tx = self.tx.clone();
+                            let ctx = ctx.clone();
                             spawn(async move {
                                 if let Err(err) = manager.disconnect().await {
                                     tx.send(Action::Error(err)).unwrap();
+                                    ctx.request_repaint();
                                 }
                             });
                         }
 
-                        if ui.button("Send Get Prop Packet").clicked() {
-                            let manager = self.transport_manager.clone().unwrap();
-                            let id = manager.next_message_id();
+                        if let Some(status) = &self.device_status {
+                            ui.horizontal(|ui| {
+                                ui.label("state: ");
+                                ui.label(serde_plain::to_string(&status.0).unwrap());
+                            });
 
-                            spawn(async move {
-                                let packet = manager
-                                    .wait_for_response(AvocadoPacket {
+                            ui.horizontal(|ui| {
+                                ui.label("sub state: ");
+                                ui.label(serde_plain::to_string(&status.1).unwrap());
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("alerts: ");
+                                ui.label(&status.2);
+                            });
+                        }
+
+                        ui.separator();
+
+                        ui.heading("Current Job");
+
+                        if self.send_progress.is_none() && self.job_status.is_none() {
+                            if ui.button("Print Canvas").clicked() {
+                                let im = self.render_image();
+                                let buf = encode_image(&im);
+
+                                let manager = self.transport_manager.clone().unwrap();
+                                let tx = self.tx.clone();
+                                let ctx = ctx.clone();
+                                self.send_progress = None;
+
+                                let hash = sha1::Sha1::digest(&buf);
+                                debug!("calculated image hash: {}", hex::encode(hash));
+
+                                let time = current_timestamp_millis();
+
+                                spawn(async move {
+                                    let id = manager.next_message_id();
+                                    let packet = AvocadoPacket {
                                         version: 100,
                                         content_type: crate::protocol::ContentType::Message,
                                         interaction_type: crate::protocol::InteractionType::Request,
@@ -401,29 +551,78 @@ impl eframe::App for SapodillaApp {
                                         msg_package_num: 1,
                                         is_subpackage: false,
                                         data: serde_json::to_vec(&serde_json::json!({
-                                            "id" : id,
-                                            "method" : "get-prop",
-                                            "params" : [
-                                                "model",
-                                                "mac-address",
-                                                "serial-number",
-                                                "sn-pcba",
-                                                "firmware-revision",
-                                                "hardware-revision",
-                                                "bt-phone-mac",
-                                                "printer-state",
-                                                "printer-sub-state",
-                                                "printer-state-alerts",
-                                                "auto-off-interval"
-                                            ]
-                                        }))
-                                        .unwrap(),
-                                    })
-                                    .await
-                                    .unwrap();
+                                            "id": id,
+                                            "method": "print-job",
+                                            "params": {
+                                                "media-size": 5012,
+                                                "media-type": 2010,
+                                                "job-type": 0,
+                                                "channel": 30784,
+                                                "file-size": buf.len(),
+                                                "document-format": 9,
+                                                "document-name": format!("{}.jpeg", time),
+                                                "hash-method": 1,
+                                                "hash-value": hex::encode(hash),
+                                                "user-account": "000000.00000000000000000000000000000000.0000",
+                                                "link-type": 1000,
+                                                "job-send-time": time / 1000,
+                                                "copies": 1,
+                                            },
+                                        })).unwrap(),
+                                    };
+                                    debug!(?packet, "built print job packet");
+                                    let packet = manager.wait_for_response(packet).await.unwrap();
+                                    debug!(?packet, "got response packet");
 
-                                info!("got info packet: {packet:?}");
-                            });
+                                    #[derive(Debug, Deserialize)]
+                                    #[serde(rename_all = "kebab-case")]
+                                    struct JobResult {
+                                        job_id: u32,
+                                    }
+
+                                    let job_id = packet.as_json::<AvocadoResult<JobResult>>().unwrap().result.job_id;
+                                    debug!(job_id, "got job id");
+
+                                    manager
+                                        .send_data(job_id, &buf, |total, sent| {
+                                            debug!(total, sent, "finished packet");
+                                            let _ = tx.send(Action::SendProgress(
+                                                sent as f32 / total as f32,
+                                            ));
+                                            ctx.request_repaint();
+                                        })
+                                        .await
+                                        .unwrap();
+
+                                    manager.poll_job(job_id).await.unwrap();
+                                    info!("finished sending data");
+                                });
+                            }
+                        } else {
+                            if let Some(send_progress) = self.send_progress {
+                                ui.horizontal(|ui| {
+                                    ui.label("send progress: ");
+                                    ui.add(
+                                        egui::ProgressBar::new(send_progress)
+                                            .show_percentage()
+                                            .animate(true),
+                                    );
+                                });
+                            }
+
+                            if let Some(status) = &self.job_status {
+                                ui.horizontal(|ui| {
+                                    ui.label("state: ");
+                                    ui.label(serde_plain::to_string(&status.job_state).unwrap());
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("sub state: ");
+                                    ui.label(
+                                        serde_plain::to_string(&status.job_sub_state).unwrap(),
+                                    );
+                                });
+                            }
                         }
                     }
                     TransportStatus::Connecting => {
@@ -620,4 +819,38 @@ impl eframe::App for SapodillaApp {
             &self.avocado_debug_packets,
         );
     }
+}
+
+fn encode_image(im: &image::DynamicImage) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1024 * 1024);
+    let mut quality = 100;
+    loop {
+        // Image needs to be under 1MB, so decrease quality
+        // until we get there.
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+        encoder.encode_image(im).unwrap();
+        debug!(quality, len = buf.len(), "got jpeg size");
+
+        if buf.len() <= 1024 * 1024 || quality == 0 {
+            break;
+        }
+
+        quality -= 1;
+        buf.clear();
+    }
+
+    buf
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_timestamp_millis() -> u64 {
+    web_sys::window().unwrap().performance().unwrap().now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_timestamp_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }

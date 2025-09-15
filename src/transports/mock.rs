@@ -1,10 +1,13 @@
 use std::borrow::Cow;
 
 use async_trait::async_trait;
-use futures::{SinkExt, channel::mpsc};
+use futures::{
+    SinkExt,
+    channel::{mpsc, oneshot},
+};
 
 use crate::{
-    protocol,
+    protocol::AvocadoPacket,
     transports::{TransportControl, TransportEvent, TransportStatus},
 };
 
@@ -27,7 +30,9 @@ impl TransportControl for MockTransport {
         mut event_tx: mpsc::UnboundedSender<TransportEvent>,
     ) -> anyhow::Result<()> {
         event_tx
-            .send(TransportEvent::StatusChange(TransportStatus::Disconnected))
+            .send(TransportEvent::TransportStatus(
+                TransportStatus::Disconnected,
+            ))
             .await?;
 
         Ok(())
@@ -37,7 +42,13 @@ impl TransportControl for MockTransport {
         Ok(())
     }
 
-    async fn send_packet(&mut self, _packet: protocol::AvocadoPacket) -> anyhow::Result<()> {
-        Ok(())
+    async fn send_packet(
+        &mut self,
+        _packet: AvocadoPacket,
+    ) -> anyhow::Result<oneshot::Receiver<()>> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+
+        Ok(rx)
     }
 }
