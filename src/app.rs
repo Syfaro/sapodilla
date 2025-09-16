@@ -75,13 +75,63 @@ impl<A> ContextSender<A> {
 }
 
 pub struct LoadedImage {
-    sized_texture: egui::load::SizedTexture,
-    offset: Pos2,
-    image: image::RgbaImage,
+    pub image: image::RgbaImage,
+    pub sized_texture: egui::load::SizedTexture,
+
+    pub offset: Pos2,
+    pub scale: Vec2,
+    pub scale_locked: bool,
 
     // We need this handle so egui doesn't drop the texture.
     #[allow(dead_code)]
     handle: egui::TextureHandle,
+}
+
+impl LoadedImage {
+    pub fn new(ctx: &egui::Context, data: &[u8], offset: Option<Pos2>) -> anyhow::Result<Self> {
+        let im = image::load_from_memory(data)?;
+        trace!("loaded image");
+
+        let (width, height) = im.dimensions();
+        trace!(width, height, "got image size");
+
+        let im = im.to_rgba8();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            im.as_bytes(),
+        );
+
+        let handle = ctx.load_texture(Uuid::new_v4(), color_image, egui::TextureOptions::LINEAR);
+        let sized_texture =
+            egui::load::SizedTexture::new(handle.id(), Vec2::new(width as f32, height as f32));
+        trace!(id = ?handle.id(), "finished loading texture");
+
+        Ok(LoadedImage {
+            image: im,
+            sized_texture,
+            offset: offset.unwrap_or(Pos2::ZERO),
+            scale: Vec2::splat(1.0),
+            scale_locked: true,
+            handle,
+        })
+    }
+
+    pub fn size(&self) -> Vec2 {
+        self.sized_texture.size * self.scale
+    }
+
+    pub fn rescale(&mut self, new_scale: Vec2) {
+        if self.scale == new_scale {
+            return;
+        }
+
+        let current_size = self.size();
+        self.scale = new_scale;
+        let new_size = self.size();
+
+        let change = (new_size - current_size) / 2.0;
+        self.offset -= change;
+    }
 }
 
 impl SapodillaApp {
@@ -105,7 +155,7 @@ impl SapodillaApp {
             if let Some(file) = file {
                 let data = file.read().await;
 
-                let action = match Self::prepare_file(&ctx, &data) {
+                let action = match LoadedImage::new(&ctx, &data, None) {
                     Ok(image) => Action::LoadedImage(Ok(image)),
                     Err(err) => Action::LoadedImage(Err(err)),
                 };
@@ -113,32 +163,6 @@ impl SapodillaApp {
                 tx.send(action).unwrap();
             }
         });
-    }
-
-    fn prepare_file(ctx: &egui::Context, data: &[u8]) -> anyhow::Result<LoadedImage> {
-        let im = image::load_from_memory(data)?;
-        trace!("loaded image");
-
-        let (width, height) = im.dimensions();
-
-        let im = im.to_rgba8();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            im.as_bytes(),
-        );
-
-        let handle = ctx.load_texture(Uuid::new_v4(), color_image, egui::TextureOptions::LINEAR);
-
-        let sized_texture =
-            egui::load::SizedTexture::new(handle.id(), Vec2::new(width as f32, height as f32));
-        trace!("finished creating textures");
-
-        Ok(LoadedImage {
-            handle,
-            sized_texture,
-            image: im,
-            offset: Pos2::ZERO,
-        })
     }
 
     fn render_image(&self) -> image::DynamicImage {
@@ -636,6 +660,12 @@ impl eframe::App for SapodillaApp {
                         }
                     }
                 }
+
+                ui.separator();
+
+                if !self.loaded_images.is_empty() {
+                    views::loaded_images(ui, &mut self.loaded_images);
+                }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -667,10 +697,8 @@ impl eframe::App for SapodillaApp {
 
                             for (idx, image) in self.loaded_images.iter_mut().enumerate() {
                                 let pos_in_screen = to_screen.transform_pos(image.offset);
-                                let image_rect = egui::Rect::from_min_size(
-                                    pos_in_screen,
-                                    image.sized_texture.size,
-                                );
+                                let image_rect =
+                                    egui::Rect::from_min_size(pos_in_screen, image.size());
 
                                 let rect_id = response.id.with(idx);
                                 let rect_response =
@@ -701,10 +729,7 @@ impl eframe::App for SapodillaApp {
                                 } else {
                                     painter.image(
                                         image.sized_texture.id,
-                                        egui::Rect::from_min_size(
-                                            pos_in_screen,
-                                            image.sized_texture.size,
-                                        ),
+                                        egui::Rect::from_min_size(pos_in_screen, image.size()),
                                         egui::Rect::from_min_max(
                                             Pos2::new(0.0, 0.0),
                                             Pos2::new(1.0, 1.0),
@@ -757,7 +782,7 @@ impl eframe::App for SapodillaApp {
                 let tx = self.tx.clone();
                 spawn(async move {
                     for file in files {
-                        tx.send(Action::LoadedImage(Self::prepare_file(&ctx, &file)))
+                        tx.send(Action::LoadedImage(LoadedImage::new(&ctx, &file, None)))
                             .unwrap();
                         ctx.request_repaint();
                     }

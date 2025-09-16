@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, io::Cursor};
+use std::{collections::VecDeque, io::Cursor, ops::RangeInclusive};
 
-use egui::{Id, Modal, Ui, Vec2};
+use egui::{Id, Modal, Pos2, Ui, Vec2};
 use egui_extras::{
     Column, TableBuilder,
     syntax_highlighting::{CodeTheme, code_view_ui},
@@ -8,7 +8,7 @@ use egui_extras::{
 use tracing::debug;
 
 use crate::{
-    app::{Action, ContextSender},
+    app::{Action, ContextSender, LoadedImage},
     protocol::{self, AvocadoId, AvocadoPacket, AvocadoPacketReader, ProtocolError},
     spawn,
 };
@@ -248,4 +248,128 @@ fn packet_details(ui: &mut Ui, has_exactly_one: bool, index: usize, packet: &Avo
                 );
             }
         });
+}
+
+pub fn loaded_images(ui: &mut Ui, loaded_images: &mut Vec<LoadedImage>) {
+    ui.heading("Images");
+
+    let mut remove = None;
+
+    for (index, image) in loaded_images.iter_mut().enumerate() {
+        image_controls(ui, image, index, &mut remove);
+
+        ui.add_space(16.0);
+    }
+
+    if let Some(remove) = remove {
+        loaded_images.remove(remove);
+    }
+}
+
+pub fn image_controls(
+    ui: &mut Ui,
+    image: &mut LoadedImage,
+    index: usize,
+    remove_index: &mut Option<usize>,
+) {
+    ui.horizontal(|ui| {
+        let (response, painter) = ui.allocate_painter(Vec2::splat(50.0), egui::Sense::empty());
+
+        painter.image(
+            image.sized_texture.id,
+            response.rect,
+            egui::Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+
+        ui.vertical(|ui| {
+            ui.spacing_mut().interact_size.x = 72.0;
+            ui.spacing_mut().item_spacing.y = 8.0;
+
+            ui.horizontal(|ui| {
+                ui.monospace("X:");
+                ui.add(px_slider(
+                    &mut image.offset.x,
+                    300.0,
+                    (-image.sized_texture.size.x * 2.0)
+                        ..=((4.0 * 300.0) + image.sized_texture.size.x * 2.0),
+                ));
+
+                ui.monospace("Y:");
+                ui.add(px_slider(
+                    &mut image.offset.y,
+                    300.0,
+                    (-image.sized_texture.size.y * 2.0)
+                        ..=((6.0 * 300.0) + image.sized_texture.size.y * 2.0),
+                ));
+            });
+
+            ui.horizontal(|ui| {
+                ui.monospace("W:");
+                let mut width = image.size().x;
+                ui.add(px_slider(&mut width, 300.0, 1.0..=(4.0 * 300.0 * 10.0)));
+
+                if width != image.size().x {
+                    let new_scale = if image.scale_locked {
+                        width / image.size().x * image.scale
+                    } else {
+                        Vec2 {
+                            x: width / image.size().x * image.scale.x,
+                            ..image.scale
+                        }
+                    };
+
+                    image.rescale(new_scale);
+                }
+
+                ui.monospace("H:");
+                let mut height = image.size().y;
+                ui.add(px_slider(&mut height, 300.0, 1.0..=(4.0 * 300.0 * 10.0)));
+
+                if height != image.size().y {
+                    let new_scale = if image.scale_locked {
+                        height / image.size().y * image.scale
+                    } else {
+                        Vec2 {
+                            y: height / image.size().y * image.scale.y,
+                            ..image.scale
+                        }
+                    };
+
+                    image.rescale(new_scale);
+                }
+
+                if ui
+                    .small_button(if image.scale_locked { "Unlock" } else { "Lock" })
+                    .clicked()
+                {
+                    image.scale_locked = !image.scale_locked;
+                }
+            });
+
+            if ui.small_button("Remove").clicked() {
+                *remove_index = Some(index);
+            }
+        });
+    });
+}
+
+pub fn px_slider<'a>(
+    value: &'a mut f32,
+    dpi: f64,
+    range: RangeInclusive<f32>,
+) -> egui::DragValue<'a> {
+    egui::DragValue::new(value)
+        .max_decimals(0)
+        .suffix(" px")
+        .range(range)
+        .custom_parser(move |val| {
+            let lower = val.trim().to_ascii_lowercase();
+
+            if let Some(val) = lower.strip_suffix("in") {
+                val.trim().parse().map(|val: f64| val * dpi).ok()
+            } else {
+                val.strip_suffix("px").unwrap_or(&lower).trim().parse().ok()
+            }
+        })
 }

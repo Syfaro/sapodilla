@@ -18,7 +18,7 @@ the latest version [here](https://sapodilla.pages.dev).
 - [ ] Canvas Editor
     - [x] Image upload
     - [x] Image placement
-    - [ ] Image scaling
+    - [x] Image scaling
     - [ ] Image rotation
     - [ ] Image layers
     - [ ] Image alignment
