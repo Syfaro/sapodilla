@@ -25,6 +25,15 @@ where
     wasm_bindgen_futures::spawn_local(future);
 }
 
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn spawn_blocking<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    wasm_thread::spawn(f);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn spawn<F>(future: F)
@@ -32,6 +41,15 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     tokio::task::spawn(future);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn spawn_blocking<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    tokio::task::spawn_blocking(f);
 }
 
 /// Create a stream that resolves every given interval.

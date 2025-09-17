@@ -1,6 +1,7 @@
-use std::{collections::HashMap, sync::mpsc};
+use std::collections::HashMap;
 
 use egui::Vec2;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use geo::{
     Buffer, ChaikinSmoothing, Contains, Coord, Euclidean, Intersects, LineString, MultiPolygon,
     Polygon, Rect, Scale, Simplify, Validation, Winding, coord, line_measures::LengthMeasurable,
@@ -8,9 +9,9 @@ use geo::{
 use image::imageops::{self, FilterType};
 use imageproc::contours::BorderType;
 use itertools::Itertools;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, trace, warn};
 
-use crate::{app::LoadedImage, spawn};
+use crate::{app::LoadedImage, spawn_blocking};
 
 #[derive(Debug)]
 pub enum CutAction {
@@ -47,7 +48,7 @@ impl Default for CutTuning {
 }
 
 pub struct CutGenerator {
-    tx: mpsc::Sender<CutAction>,
+    tx: UnboundedSender<CutAction>,
     images: Vec<LoadedImage>,
     tuning: CutTuning,
     canvas_size: Vec2,
@@ -58,8 +59,8 @@ impl CutGenerator {
         images: Vec<LoadedImage>,
         tuning: CutTuning,
         canvas_size: Vec2,
-    ) -> mpsc::Receiver<CutAction> {
-        let (tx, rx) = mpsc::channel();
+    ) -> UnboundedReceiver<CutAction> {
+        let (tx, rx) = unbounded();
 
         let cut_generator = Self {
             tx,
@@ -68,7 +69,7 @@ impl CutGenerator {
             canvas_size,
         };
 
-        spawn(async move {
+        spawn_blocking(move || {
             if let Err(err) = cut_generator.process() {
                 error!("could not process cuts: {err}");
             }
@@ -80,7 +81,7 @@ impl CutGenerator {
     fn process(self) -> anyhow::Result<()> {
         let total = self.images.len();
 
-        self.tx.send(CutAction::Progress {
+        self.tx.unbounded_send(CutAction::Progress {
             completed: 0,
             total,
         })?;
@@ -94,7 +95,7 @@ impl CutGenerator {
                 polygons.push(polygon);
             }
 
-            self.tx.send(CutAction::Progress {
+            self.tx.unbounded_send(CutAction::Progress {
                 completed: index + 1,
                 total,
             })?;
@@ -115,7 +116,7 @@ impl CutGenerator {
             .iter()
             .any(|polygons| !canvas_polygon.contains(polygons));
 
-        self.tx.send(CutAction::Done(CutResult {
+        self.tx.unbounded_send(CutAction::Done(CutResult {
             has_intersections,
             off_canvas,
             polygons,
@@ -124,7 +125,6 @@ impl CutGenerator {
         Ok(())
     }
 
-    #[instrument(skip_all)]
     fn image(&self, image: &LoadedImage) -> Option<MultiPolygon<f32>> {
         trace!("starting processing image");
 

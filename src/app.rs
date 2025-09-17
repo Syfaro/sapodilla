@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
 
 use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
-use futures::lock::Mutex;
+use futures::{StreamExt, lock::Mutex};
 use image::{EncodableLayout, GenericImageView};
 use serde::Deserialize;
 use sha1::Digest;
@@ -705,10 +705,10 @@ impl eframe::App for SapodillaApp {
                     self.cut_progress = None;
 
                     let tx = self.tx.clone();
-                    let rx = CutGenerator::start(self.loaded_images.clone(), self.cut_tuning.clone(), Vec2::new(4.0 * 300.0, 6.0 * 300.0));
+                    let mut rx = CutGenerator::start(self.loaded_images.clone(), self.cut_tuning.clone(), Vec2::new(4.0 * 300.0, 6.0 * 300.0));
 
                     spawn(async move {
-                        while let Ok(action) = rx.recv() {
+                        while let Some(action) = rx.next().await {
                             debug!(?action, "got cut action");
 
                             if let Err(err) = tx.send(Action::Cut(action)) {

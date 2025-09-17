@@ -10,7 +10,9 @@
   <head>
     <title>Sapodilla</title>
 
-    <link data-trunk rel="rust" data-wasm-opt="2" />
+    <link data-trunk rel="rust" data-wasm-opt="2" data-bindgen-target="web" />
+    <link data-trunk rel="copy-file" href="static/_headers" />
+
     <base data-trunk-public-url />
 
     <style>
