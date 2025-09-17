@@ -31,7 +31,11 @@ fn spawn_blocking<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
+    #[cfg(feature = "web-workers")]
     wasm_thread::spawn(f);
+
+    #[cfg(not(feature = "web-workers"))]
+    f();
 }
 
 #[cfg(not(target_arch = "wasm32"))]

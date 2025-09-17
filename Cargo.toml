@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 authors = ["Syfaro <syfaro@huefox.com>"]
 
+[features]
+web-workers = ["wasm_thread"]
+
 [dependencies]
 anyhow = "1.0.99"
 async-trait = "0.1.89"
@@ -63,7 +66,7 @@ uuid = { version = "1.18.1", features = ["v4"] }
 console_error_panic_hook = "0.1.7"
 gloo-timers = { version = "0.3", features = ["futures"] }
 uuid = { version = "1.18.1", features = ["v4", "js"] }
-wasm_thread = "0.3.3"
+wasm_thread = { version = "0.3.3", optional = true }
 wasm-bindgen-futures = "0.4.50"
 wasm-tracing = "2.1.0"
 web-sys = "0.3.70"
