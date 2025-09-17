@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, io::Cursor, ops::RangeInclusive};
 
-use egui::{Id, Modal, Pos2, Ui, Vec2};
+use egui::{Id, Modal, Pos2, ProgressBar, Ui, Vec2};
 use egui_extras::{
     Column, TableBuilder,
     syntax_highlighting::{CodeTheme, code_view_ui},
@@ -9,9 +9,14 @@ use tracing::debug;
 
 use crate::{
     app::{Action, ContextSender, LoadedImage},
+    cut::CutTuning,
     protocol::{self, AvocadoId, AvocadoPacket, AvocadoPacketReader, ProtocolError},
     spawn,
 };
+
+pub use canvas::canvas_editor;
+
+mod canvas;
 
 pub fn pretty_hex(id: impl std::hash::Hash, ui: &mut Ui, data: &[u8]) {
     const SECTIONS_PER_LINE: usize = 4;
@@ -372,4 +377,90 @@ pub fn px_slider<'a>(
                 val.strip_suffix("px").unwrap_or(&lower).trim().parse().ok()
             }
         })
+}
+
+pub fn cut_controls(
+    ui: &mut Ui,
+    cut_tuning: &mut CutTuning,
+    progress: Option<(usize, usize)>,
+    has_intersections: bool,
+    off_canvas: bool,
+) {
+    ui.heading("Cut Preparation");
+
+    let progress_pct = progress
+        .map(|(completed, total)| completed as f32 / total as f32)
+        .unwrap_or(0.0);
+
+    ui.add_visible(
+        progress.is_some(),
+        ProgressBar::new(progress_pct)
+            .animate(progress.is_some())
+            .show_percentage(),
+    );
+
+    ui.checkbox(&mut cut_tuning.internal, "Allow Internal Cuts");
+
+    let mut buffer = cut_tuning.buffer / 300.0 * 25.4;
+    ui.add(
+        egui::Slider::new(&mut buffer, 0.0..=5.0)
+            .suffix(" mm")
+            .text("Padding Distance"),
+    )
+    .on_hover_text("Padding between the edges of the sticker and the cutline");
+    cut_tuning.buffer = buffer * 300.0 / 25.4;
+
+    let mut minimum_length = cut_tuning.minimum_length / 300.0;
+    ui.add(
+        egui::Slider::new(&mut minimum_length, 0.05..=1.0)
+            .suffix(" in")
+            .text("Minimum Cut Length"),
+    )
+    .on_hover_text("Minimum length to cut, anything smaller will be ignored");
+    cut_tuning.minimum_length = minimum_length * 300.0;
+
+    ui.collapsing("Advanced Settings", |ui| {
+        ui.add(egui::Slider::new(&mut cut_tuning.simplify, 0.0..=5.0).text("Simplify Amount"))
+            .on_hover_text("Simplification epsilon, decreases total number of line segments");
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut cut_tuning.smoothing)
+                    .range(0..=10)
+                    .speed(0.05),
+            );
+            ui.label("Smoothing Steps");
+        })
+        .response
+        .on_hover_text("Increases number of smoothing iterations");
+    });
+
+    let error_messages: Vec<_> = [
+        has_intersections.then_some("Cut Lines Overlap"),
+        off_canvas.then_some("Cut Lines Out of Bounds"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if error_messages.is_empty() {
+        ui.add_visible(
+            false,
+            egui::Label::new(
+                egui::RichText::new("Error Message")
+                    .strong()
+                    .color(egui::Color32::RED),
+            ),
+        );
+    } else {
+        ui.horizontal(|ui| {
+            for message in error_messages {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(message)
+                        .strong()
+                        .color(egui::Color32::RED),
+                ));
+            }
+        });
+    }
 }

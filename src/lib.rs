@@ -1,4 +1,5 @@
 mod app;
+mod cut;
 mod protocol;
 mod transports;
 mod views;

@@ -19,9 +19,12 @@ egui = "0.32.3"
 egui_extras = { version = "0.32.3", features = ["image", "syntect"] }
 enum_dispatch = "0.3.13"
 futures = "0.3"
+geo = { version = "0.31.0", default-features = false }
 hex = "0.4.3"
 hex-literal = "1"
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
+imageproc = { version = "0.25.0", default-features = false }
+itertools = "0.14.0"
 oneshot = "0.1"
 packed_struct = "0.10"
 rfd = "0.15.4"

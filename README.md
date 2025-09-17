@@ -22,9 +22,9 @@ the latest version [here](https://sapodilla.pages.dev).
     - [ ] Image rotation
     - [ ] Image layers
     - [ ] Image alignment
+    - [x] Cut mark preview
+    - [x] Cut mark generation
     - [ ] Upload format supporting cut marks
-    - [ ] Cut mark preview
-    - [ ] Cut mark generation (stretch goal)
 - [ ] Photo Printing
     - [x] Single print job
     - [ ] Set number of copies

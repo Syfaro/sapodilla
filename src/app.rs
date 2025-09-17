@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
 
-use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2, emath};
+use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::lock::Mutex;
 use image::{EncodableLayout, GenericImageView};
 use serde::Deserialize;
@@ -9,7 +9,14 @@ use strum::IntoEnumIterator;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
-use crate::{Rc, protocol::*, spawn, transports::*, views};
+use crate::{
+    Rc,
+    cut::{CutAction, CutGenerator, CutTuning},
+    protocol::*,
+    spawn,
+    transports::*,
+    views,
+};
 
 #[derive(derive_more::Debug)]
 pub enum Action {
@@ -19,33 +26,39 @@ pub enum Action {
     LoadedAvocadoPackets(Result<Vec<AvocadoPacket>, ProtocolError>),
     LoadedImage(#[debug(skip)] anyhow::Result<LoadedImage>),
     SendProgress(f32),
+    Cut(CutAction),
 }
 
 pub struct SapodillaApp {
-    tx: ContextSender<Action>,
-    rx: mpsc::Receiver<Action>,
+    pub tx: ContextSender<Action>,
+    pub rx: mpsc::Receiver<Action>,
 
-    transports: Vec<Rc<Mutex<Transport>>>,
-    transport_names: Vec<Cow<'static, str>>,
-    selected_transport_index: usize,
+    pub transports: Vec<Rc<Mutex<Transport>>>,
+    pub transport_names: Vec<Cow<'static, str>>,
+    pub selected_transport_index: usize,
 
-    transport_manager: Option<Rc<TransportManager>>,
-    transport_status: TransportStatus,
-    device_status: Option<(PrinterState, PrinterSubState, String)>,
-    job_status: Option<JobStatusInfo>,
-    send_progress: Option<f32>,
+    pub transport_manager: Option<Rc<TransportManager>>,
+    pub transport_status: TransportStatus,
+    pub device_status: Option<(PrinterState, PrinterSubState, String)>,
+    pub job_status: Option<JobStatusInfo>,
+    pub send_progress: Option<f32>,
 
-    packets: VecDeque<AvocadoPacket>,
-    viewing_packet: Option<AvocadoPacket>,
+    pub packets: VecDeque<AvocadoPacket>,
+    pub viewing_packet: Option<AvocadoPacket>,
+    pub cut_tuning: CutTuning,
+    pub cut_shapes: Vec<geo::MultiPolygon<f32>>,
+    pub has_intersections: bool,
+    pub off_canvas: bool,
+    pub cut_progress: Option<(usize, usize)>,
 
-    showing_packet_log: bool,
-    showing_avocado_packet_debug: bool,
-    avocado_debug_packets: Option<Result<Vec<AvocadoPacket>, ProtocolError>>,
+    pub showing_packet_log: bool,
+    pub showing_avocado_packet_debug: bool,
+    pub avocado_debug_packets: Option<Result<Vec<AvocadoPacket>, ProtocolError>>,
 
-    canvas_rect: egui::Rect,
-    loaded_images: Vec<LoadedImage>,
+    pub canvas_rect: egui::Rect,
+    pub loaded_images: Vec<LoadedImage>,
 
-    error: Option<anyhow::Error>,
+    pub error: Option<anyhow::Error>,
 }
 
 pub struct ContextSender<A> {
@@ -74,6 +87,7 @@ impl<A> ContextSender<A> {
     }
 }
 
+#[derive(Clone)]
 pub struct LoadedImage {
     pub image: image::RgbaImage,
     pub sized_texture: egui::load::SizedTexture,
@@ -241,6 +255,11 @@ impl SapodillaApp {
 
             packets: Default::default(),
             viewing_packet: None,
+            cut_tuning: Default::default(),
+            cut_shapes: Vec::new(),
+            has_intersections: false,
+            off_canvas: false,
+            cut_progress: None,
 
             showing_packet_log: false,
             showing_avocado_packet_debug: false,
@@ -310,6 +329,17 @@ impl eframe::App for SapodillaApp {
                 Action::SendProgress(pct) => {
                     self.send_progress = Some(pct);
                 }
+                Action::Cut(action) => match action {
+                    CutAction::Progress { completed, total } => {
+                        self.cut_progress = Some((completed, total));
+                    }
+                    CutAction::Done(result) => {
+                        self.has_intersections = result.has_intersections;
+                        self.cut_shapes = result.polygons;
+                        self.cut_progress = None;
+                        self.off_canvas = result.off_canvas;
+                    }
+                },
             }
         }
 
@@ -663,93 +693,39 @@ impl eframe::App for SapodillaApp {
 
                 ui.separator();
 
+                views::cut_controls(ui, &mut self.cut_tuning, self.cut_progress, self.has_intersections, self.off_canvas);
+
+                if ui.add_enabled(
+                    self.cut_progress.is_none(),
+                    egui::Button::new("Generate Cut Lines")
+                ).clicked() {
+                    self.cut_shapes.clear();
+                    self.has_intersections = false;
+                    self.off_canvas = false;
+                    self.cut_progress = None;
+
+                    let tx = self.tx.clone();
+                    let rx = CutGenerator::start(self.loaded_images.clone(), self.cut_tuning.clone(), Vec2::new(4.0 * 300.0, 6.0 * 300.0));
+
+                    spawn(async move {
+                        while let Ok(action) = rx.recv() {
+                            debug!(?action, "got cut action");
+
+                            if let Err(err) = tx.send(Action::Cut(action)) {
+                                error!("could not send cut action: {err}");
+                            }
+                        }
+                    });
+                }
+
                 if !self.loaded_images.is_empty() {
+                    ui.separator();
                     views::loaded_images(ui, &mut self.loaded_images);
                 }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let scene = egui::Scene::new().zoom_range(0.1..=3.0);
-
-            let mut inner_rect = egui::Rect::NAN;
-
-            let response = scene
-                .show(ui, &mut self.canvas_rect, |ui| {
-                    egui::Frame::canvas(ui.style())
-                        .fill(egui::Color32::WHITE)
-                        .inner_margin(0.0)
-                        .stroke(egui::Stroke::new(4.0, egui::Color32::BLACK))
-                        .show(ui, |ui| {
-                            let size = Vec2::new(4.0 * 300.0, 6.0 * 300.0);
-
-                            ui.set_min_size(size);
-                            ui.set_max_size(size);
-
-                            let (response, painter) =
-                                ui.allocate_painter(size, egui::Sense::empty());
-
-                            let to_screen = emath::RectTransform::from_to(
-                                egui::Rect::from_min_size(Pos2::ZERO, response.rect.size()),
-                                response.rect,
-                            );
-
-                            let mut remove = None;
-
-                            for (idx, image) in self.loaded_images.iter_mut().enumerate() {
-                                let pos_in_screen = to_screen.transform_pos(image.offset);
-                                let image_rect =
-                                    egui::Rect::from_min_size(pos_in_screen, image.size());
-
-                                let rect_id = response.id.with(idx);
-                                let rect_response =
-                                    ui.interact(image_rect, rect_id, egui::Sense::drag());
-
-                                image.offset += rect_response.drag_delta();
-
-                                let pos_in_screen = to_screen.transform_pos(image.offset);
-
-                                let tint = if rect_response.hovered() {
-                                    egui::Color32::LIGHT_BLUE
-                                } else {
-                                    egui::Color32::WHITE
-                                };
-
-                                if rect_response.hovered()
-                                    && ui.input_mut(|i| {
-                                        i.consume_shortcut(&KeyboardShortcut::new(
-                                            Modifiers::NONE,
-                                            egui::Key::Delete,
-                                        )) || i.consume_shortcut(&KeyboardShortcut::new(
-                                            Modifiers::NONE,
-                                            egui::Key::Backspace,
-                                        ))
-                                    })
-                                {
-                                    remove = Some(idx);
-                                } else {
-                                    painter.image(
-                                        image.sized_texture.id,
-                                        egui::Rect::from_min_size(pos_in_screen, image.size()),
-                                        egui::Rect::from_min_max(
-                                            Pos2::new(0.0, 0.0),
-                                            Pos2::new(1.0, 1.0),
-                                        ),
-                                        tint,
-                                    );
-                                }
-                            }
-
-                            if let Some(remove) = remove {
-                                self.loaded_images.remove(remove);
-                            }
-                        });
-                    inner_rect = ui.min_rect();
-                })
-                .response;
-
-            if response.double_clicked() {
-                self.canvas_rect = inner_rect.shrink(ui.style().spacing.menu_spacing);
-            }
+            views::canvas_editor(ui, self);
 
             ctx.input(|i| {
                 if i.raw.dropped_files.is_empty() {
