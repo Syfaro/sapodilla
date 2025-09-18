@@ -45,7 +45,7 @@ impl TransportControl for WebSerialTransport {
     async fn start(
         &mut self,
         mut event_tx: mpsc::UnboundedSender<TransportEvent>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> anyhow::Result<()> {
         let navigator = web_sys::window().unwrap().navigator();
         if !js_sys::Reflect::has(&navigator, &JsValue::from_str("serial")).unwrap() {
             anyhow::bail!("navigator does not have serial API");

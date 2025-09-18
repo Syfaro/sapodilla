@@ -11,7 +11,7 @@ use imageproc::contours::BorderType;
 use itertools::Itertools;
 use tracing::{debug, error, trace, warn};
 
-use crate::{app::LoadedImage, spawn_blocking};
+use crate::{app::LoadedImage, protocol::CanvasSize, spawn_blocking};
 
 #[derive(Debug)]
 pub enum CutAction {
@@ -51,14 +51,14 @@ pub struct CutGenerator {
     tx: UnboundedSender<CutAction>,
     images: Vec<LoadedImage>,
     tuning: CutTuning,
-    canvas_size: Vec2,
+    canvas_size: &'static CanvasSize,
 }
 
 impl CutGenerator {
     pub fn start(
         images: Vec<LoadedImage>,
         tuning: CutTuning,
-        canvas_size: Vec2,
+        canvas_size: &'static CanvasSize,
     ) -> UnboundedReceiver<CutAction> {
         let (tx, rx) = unbounded();
 
@@ -106,9 +106,11 @@ impl CutGenerator {
             .combinations(2)
             .any(|polygons| polygons[0].intersects(polygons[1]));
 
+        let offset = (self.canvas_size.size - self.canvas_size.safe_area) / 2.0;
+
         let canvas_polygon = Rect::new(
-            coord! { x: 0., y: 0.},
-            coord! { x: self.canvas_size.x, y: self.canvas_size.y },
+            coord! { x: offset.x, y: offset.y },
+            coord! { x: self.canvas_size.size.x - offset.x, y: self.canvas_size.size.y - offset.y },
         )
         .to_polygon();
 

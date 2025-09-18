@@ -1,10 +1,38 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use egui::Vec2;
+use lazy_static::lazy_static;
 use packed_struct::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{instrument, trace};
 
 const WRAPPER: u8 = 0x7E;
+
+lazy_static! {
+    pub static ref DEVICES: Vec<Device> = vec![Device {
+        name: "PixCut S1".to_string(),
+        model: "DHP700".to_string(),
+        dpi: 300.0,
+        modes: vec![
+            Mode {
+                mode_type: ModeType::Print,
+                canvas_sizes: vec![CanvasSize {
+                    name: "4x6".to_string(),
+                    size: Vec2::new(4.0 * 300.0, 6.0 * 300.0),
+                    safe_area: Vec2::new(4.0 * 300.0, 6.0 * 300.0),
+                }]
+            },
+            Mode {
+                mode_type: ModeType::PrintAndCut,
+                canvas_sizes: vec![CanvasSize {
+                    name: "4x7".to_string(),
+                    size: Vec2::new(4.0 * 300.0, 7.0 * 300.0),
+                    safe_area: Vec2::new(3.543 * 300.0, 6.693 * 300.0),
+                }]
+            }
+        ]
+    }];
+}
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {
@@ -411,6 +439,47 @@ pub struct JobStatusInfo {
     pub file_size: u32,
     pub transfer_status: u32,
     pub transfer_size: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub name: String,
+    pub model: String,
+    pub dpi: f32,
+    pub modes: Vec<Mode>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModeType {
+    Print,
+    PrintAndCut,
+}
+
+impl ModeType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ModeType::Print => "Print",
+            ModeType::PrintAndCut => "Print and Cut",
+        }
+    }
+
+    pub fn has_cutting(&self) -> bool {
+        matches!(self, ModeType::PrintAndCut)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Mode {
+    pub mode_type: ModeType,
+    pub canvas_sizes: Vec<CanvasSize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanvasSize {
+    pub name: String,
+    pub size: Vec2,
+    pub safe_area: Vec2,
 }
 
 #[cfg(test)]

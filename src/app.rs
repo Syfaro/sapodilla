@@ -39,6 +39,12 @@ pub struct SapodillaApp {
 
     pub transport_manager: Option<Rc<TransportManager>>,
     pub transport_status: TransportStatus,
+
+    pub selected_device: usize,
+    pub selected_mode: usize,
+    pub selected_canvas_size: usize,
+    pub previous_canvas_size: Vec2,
+
     pub device_status: Option<(PrinterState, PrinterSubState, String)>,
     pub job_status: Option<JobStatusInfo>,
     pub send_progress: Option<f32>,
@@ -149,6 +155,55 @@ impl LoadedImage {
 }
 
 impl SapodillaApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
+        let (tx, rx) = mpsc::channel();
+        let tx = ContextSender::new(tx, cc.egui_ctx.clone());
+
+        Self {
+            tx,
+            rx,
+
+            transports: Transport::iter()
+                .map(|transport| Rc::new(Mutex::new(transport)))
+                .collect(),
+            transport_names: Transport::iter()
+                .map(|transport| transport.name())
+                .collect(),
+            selected_transport_index: 0,
+
+            transport_status: TransportStatus::Disconnected,
+            transport_manager: None,
+
+            selected_device: 0,
+            selected_mode: 0,
+            selected_canvas_size: 0,
+            previous_canvas_size: Vec2::ZERO,
+
+            device_status: None,
+            job_status: None,
+            send_progress: None,
+
+            packets: Default::default(),
+            viewing_packet: None,
+            cut_tuning: Default::default(),
+            cut_shapes: Vec::new(),
+            has_intersections: false,
+            off_canvas: false,
+            cut_progress: None,
+
+            showing_packet_log: false,
+            showing_avocado_packet_debug: false,
+            avocado_debug_packets: Default::default(),
+
+            canvas_rect: egui::Rect::ZERO,
+            loaded_images: Default::default(),
+
+            error: None,
+        }
+    }
+
     fn get_transport(&self) -> Rc<Mutex<Transport>> {
         self.transports
             .get(self.selected_transport_index)
@@ -180,8 +235,12 @@ impl SapodillaApp {
     }
 
     fn render_image(&self) -> image::DynamicImage {
-        let mut buf =
-            image::ImageBuffer::from_pixel(4 * 300, 6 * 300, image::Rgba([255u8, 255, 255, 255]));
+        let canvas = self.get_canvas().size;
+        let mut buf = image::ImageBuffer::from_pixel(
+            canvas.x as u32,
+            canvas.y as u32,
+            image::Rgba::<u8>([255, 255, 255, 255]),
+        );
 
         for loaded_image in &self.loaded_images {
             let offset_x = loaded_image.offset.x as i32;
@@ -226,55 +285,13 @@ impl SapodillaApp {
 
         buf.into()
     }
-}
 
-impl SapodillaApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-
-        let (tx, rx) = mpsc::channel();
-        let tx = ContextSender::new(tx, cc.egui_ctx.clone());
-
-        Self {
-            tx,
-            rx,
-
-            transports: Transport::iter()
-                .map(|transport| Rc::new(Mutex::new(transport)))
-                .collect(),
-            transport_names: Transport::iter()
-                .map(|transport| transport.name())
-                .collect(),
-            selected_transport_index: 0,
-
-            transport_status: TransportStatus::Disconnected,
-            transport_manager: None,
-            device_status: None,
-            job_status: None,
-            send_progress: None,
-
-            packets: Default::default(),
-            viewing_packet: None,
-            cut_tuning: Default::default(),
-            cut_shapes: Vec::new(),
-            has_intersections: false,
-            off_canvas: false,
-            cut_progress: None,
-
-            showing_packet_log: false,
-            showing_avocado_packet_debug: false,
-            avocado_debug_packets: Default::default(),
-
-            canvas_rect: egui::Rect::ZERO,
-            loaded_images: Default::default(),
-
-            error: None,
-        }
+    pub fn get_canvas(&self) -> &'static CanvasSize {
+        &DEVICES[self.selected_device].modes[self.selected_mode].canvas_sizes
+            [self.selected_canvas_size]
     }
-}
 
-impl eframe::App for SapodillaApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn apply_actions(&mut self) {
         while let Ok(action) = self.rx.try_recv() {
             info!("got action: {action:?}");
 
@@ -342,172 +359,355 @@ impl eframe::App for SapodillaApp {
                 },
             }
         }
+    }
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                egui::widgets::global_theme_preference_switch(ui);
+    fn menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::widgets::global_theme_preference_switch(ui);
+
+        ui.separator();
+
+        let is_web = cfg!(target_arch = "wasm32");
+        if !is_web {
+            ui.menu_button("File", |ui| {
+                if ui.button("Quit").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        }
+
+        let image_shortcut =
+            KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::U);
+        if ui.input_mut(|i| i.consume_shortcut(&image_shortcut)) {
+            self.upload_image(ctx);
+        }
+
+        ui.menu_button("Canvas", |ui| {
+            let btn =
+                egui::Button::new("Add Image").shortcut_text(ctx.format_shortcut(&image_shortcut));
+
+            if ui.add(btn).clicked() {
+                self.upload_image(ctx);
+            }
+        });
+
+        ui.menu_button("Connection", |ui| {
+            ui.menu_button("Transport", |ui| {
+                for (index, transport) in self.transport_names.iter().enumerate() {
+                    if ui
+                        .radio(self.selected_transport_index == index, transport.as_ref())
+                        .clicked()
+                    {
+                        if let Some(manager) = self.transport_manager.take() {
+                            let tx = self.tx.clone();
+                            spawn(async move {
+                                let action = if let Err(err) = manager.disconnect().await {
+                                    Action::Error(err)
+                                } else {
+                                    Action::ChangeTransport(index)
+                                };
+
+                                if let Err(err) = tx.send(action) {
+                                    error!("could not send action: {err}");
+                                }
+                            });
+                        } else {
+                            self.selected_transport_index = index;
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.menu_button("Debug Tools", |ui| {
+            ui.checkbox(&mut self.showing_packet_log, "Show Packet Log");
+            ui.checkbox(
+                &mut self.showing_avocado_packet_debug,
+                "Saved Packet Debugger",
+            );
+
+            if let Some(manager) = &self.transport_manager
+                && ui.button("Send Get Prop Packet").clicked()
+            {
+                let manager = manager.clone();
+                let id = manager.next_message_id();
+
+                spawn(async move {
+                    let packet = manager
+                        .wait_for_response(AvocadoPacket {
+                            version: 100,
+                            content_type: crate::protocol::ContentType::Message,
+                            interaction_type: crate::protocol::InteractionType::Request,
+                            encoding_type: EncodingType::Json,
+                            encryption_mode: EncryptionMode::None,
+                            terminal_id: id,
+                            msg_number: id,
+                            msg_package_total: 1,
+                            msg_package_num: 1,
+                            is_subpackage: false,
+                            data: serde_json::to_vec(&serde_json::json!({
+                                "id" : id,
+                                "method" : "get-prop",
+                                "params" : [
+                                    "model",
+                                    "mac-address",
+                                    "serial-number",
+                                    "sn-pcba",
+                                    "firmware-revision",
+                                    "hardware-revision",
+                                    "bt-phone-mac",
+                                    "printer-state",
+                                    "printer-sub-state",
+                                    "printer-state-alerts",
+                                    "auto-off-interval",
+                                    "media-size",
+                                ]
+                            }))
+                            .unwrap(),
+                        })
+                        .await
+                        .unwrap();
+
+                    info!("got info packet: {packet:?}");
+                });
+            }
+
+            if let Some(manager) = &self.transport_manager
+                && ui.button("Send Resume Printer").clicked()
+            {
+                let manager = manager.clone();
+                let id = manager.next_message_id();
+
+                spawn(async move {
+                    let packet = manager
+                        .wait_for_response(AvocadoPacket {
+                            version: 100,
+                            content_type: crate::protocol::ContentType::Message,
+                            interaction_type: crate::protocol::InteractionType::Request,
+                            encoding_type: EncodingType::Json,
+                            encryption_mode: EncryptionMode::None,
+                            terminal_id: id,
+                            msg_number: id,
+                            msg_package_total: 1,
+                            msg_package_num: 1,
+                            is_subpackage: false,
+                            data: serde_json::to_vec(&serde_json::json!({
+                                "id" : id,
+                                "method" : "resume-printer",
+                                "params" : []
+                            }))
+                            .unwrap(),
+                        })
+                        .await
+                        .unwrap();
+
+                    info!("got resume packet: {packet:?}");
+                });
+            }
+
+            ui.separator();
+
+            if ui.button("Export Canvas").clicked() {
+                let im = self.render_image();
+                let buf = encode_image(&im);
+
+                spawn(async move {
+                    let Some(handle) = rfd::AsyncFileDialog::new()
+                        .set_file_name("canvas.jpg")
+                        .save_file()
+                        .await
+                    else {
+                        return;
+                    };
+
+                    if let Err(err) = handle.write(&buf).await {
+                        error!("could not write canvas image: {err}");
+                    }
+                });
+            }
+        });
+    }
+
+    fn device_status(&mut self, ui: &mut egui::Ui) {
+        match self.transport_status {
+            TransportStatus::Connected => {
+                if ui.button("Disconnect").clicked()
+                    && let Some(manager) = self.transport_manager.take()
+                {
+                    let tx = self.tx.clone();
+                    spawn(async move {
+                        if let Err(err) = manager.disconnect().await {
+                            tx.send(Action::Error(err)).unwrap();
+                        }
+                    });
+                }
+
+                if let Some(status) = &self.device_status {
+                    ui.horizontal(|ui| {
+                        ui.label("State: ");
+                        ui.label(serde_plain::to_string(&status.0).unwrap());
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Sub State: ");
+                        ui.label(serde_plain::to_string(&status.1).unwrap());
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Alerts: ");
+                        ui.label(&status.2);
+                    });
+                }
 
                 ui.separator();
 
-                let is_web = cfg!(target_arch = "wasm32");
-                if !is_web {
-                    ui.menu_button("File", |ui| {
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                }
+                ui.heading("Current Job");
 
-                let image_shortcut =
-                    KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::U);
-                if ui.input_mut(|i| i.consume_shortcut(&image_shortcut)) {
-                    self.upload_image(ctx);
-                }
-
-                ui.menu_button("Canvas", |ui| {
-                    let btn = egui::Button::new("Add Image")
-                        .shortcut_text(ctx.format_shortcut(&image_shortcut));
-
-                    if ui.add(btn).clicked() {
-                        self.upload_image(ctx);
-                    }
-                });
-
-                ui.menu_button("Connection", |ui| {
-                    ui.menu_button("Transport", |ui| {
-                        for (index, transport) in self.transport_names.iter().enumerate() {
-                            if ui
-                                .radio(self.selected_transport_index == index, transport.as_ref())
-                                .clicked()
-                            {
-                                if let Some(manager) = self.transport_manager.take() {
-                                    let tx = self.tx.clone();
-                                    spawn(async move {
-                                        let action = if let Err(err) = manager.disconnect().await {
-                                            Action::Error(err)
-                                        } else {
-                                            Action::ChangeTransport(index)
-                                        };
-
-                                        if let Err(err) = tx.send(action) {
-                                            error!("could not send action: {err}");
-                                        }
-                                    });
-                                } else {
-                                    self.selected_transport_index = index;
-                                }
-                            }
-                        }
-                    });
-                });
-
-                ui.menu_button("Debug Tools", |ui| {
-                    ui.checkbox(&mut self.showing_packet_log, "Show Packet Log");
-                    ui.checkbox(
-                        &mut self.showing_avocado_packet_debug,
-                        "Saved Packet Debugger",
-                    );
-
-                    if let Some(manager) = &self.transport_manager
-                        && ui.button("Send Get Prop Packet").clicked()
-                    {
-                        let manager = manager.clone();
-                        let id = manager.next_message_id();
-
-                        spawn(async move {
-                            let packet = manager
-                                .wait_for_response(AvocadoPacket {
-                                    version: 100,
-                                    content_type: crate::protocol::ContentType::Message,
-                                    interaction_type: crate::protocol::InteractionType::Request,
-                                    encoding_type: EncodingType::Json,
-                                    encryption_mode: EncryptionMode::None,
-                                    terminal_id: id,
-                                    msg_number: id,
-                                    msg_package_total: 1,
-                                    msg_package_num: 1,
-                                    is_subpackage: false,
-                                    data: serde_json::to_vec(&serde_json::json!({
-                                        "id" : id,
-                                        "method" : "get-prop",
-                                        "params" : [
-                                            "model",
-                                            "mac-address",
-                                            "serial-number",
-                                            "sn-pcba",
-                                            "firmware-revision",
-                                            "hardware-revision",
-                                            "bt-phone-mac",
-                                            "printer-state",
-                                            "printer-sub-state",
-                                            "printer-state-alerts",
-                                            "auto-off-interval",
-                                            "media-size",
-                                        ]
-                                    }))
-                                    .unwrap(),
-                                })
-                                .await
-                                .unwrap();
-
-                            info!("got info packet: {packet:?}");
-                        });
-                    }
-
-                    if let Some(manager) = &self.transport_manager
-                        && ui.button("Send Resume Printer").clicked()
-                    {
-                        let manager = manager.clone();
-                        let id = manager.next_message_id();
-
-                        spawn(async move {
-                            let packet = manager
-                                .wait_for_response(AvocadoPacket {
-                                    version: 100,
-                                    content_type: crate::protocol::ContentType::Message,
-                                    interaction_type: crate::protocol::InteractionType::Request,
-                                    encoding_type: EncodingType::Json,
-                                    encryption_mode: EncryptionMode::None,
-                                    terminal_id: id,
-                                    msg_number: id,
-                                    msg_package_total: 1,
-                                    msg_package_num: 1,
-                                    is_subpackage: false,
-                                    data: serde_json::to_vec(&serde_json::json!({
-                                        "id" : id,
-                                        "method" : "resume-printer",
-                                        "params" : []
-                                    }))
-                                    .unwrap(),
-                                })
-                                .await
-                                .unwrap();
-
-                            info!("got resume packet: {packet:?}");
-                        });
-                    }
-
-                    ui.separator();
-
-                    if ui.button("Export Canvas").clicked() {
+                if self.send_progress.is_none() && self.job_status.is_none() {
+                    if ui.button("Print Canvas").clicked() {
                         let im = self.render_image();
                         let buf = encode_image(&im);
 
-                        spawn(async move {
-                            let Some(handle) = rfd::AsyncFileDialog::new()
-                                .set_file_name("canvas.jpg")
-                                .save_file()
-                                .await
-                            else {
-                                return;
-                            };
+                        let manager = self.transport_manager.clone().unwrap();
+                        let tx = self.tx.clone();
+                        self.send_progress = None;
 
-                            if let Err(err) = handle.write(&buf).await {
-                                error!("could not write canvas image: {err}");
+                        let hash = sha1::Sha1::digest(&buf);
+                        debug!("calculated image hash: {}", hex::encode(hash));
+
+                        let time = current_timestamp_millis();
+
+                        spawn(async move {
+                            let id = manager.next_message_id();
+
+                            let data = serde_json::json!({
+                                "id": id,
+                                "method": "print-job",
+                                "params": {
+                                    "media-size": 5012,
+                                    "media-type": 2010,
+                                    "job-type": 0,
+                                    "channel": 30784,
+                                    "file-size": buf.len(),
+                                    "document-format": 9,
+                                    "document-name": format!("{}.jpeg", time),
+                                    "hash-method": 1,
+                                    "hash-value": hex::encode(hash),
+                                    "user-account": "000000.00000000000000000000000000000000.0000",
+                                    "link-type": 1000,
+                                    "job-send-time": time / 1000,
+                                    "copies": 1,
+                                },
+                            });
+
+                            let packet = AvocadoPacket {
+                                version: 100,
+                                content_type: crate::protocol::ContentType::Message,
+                                interaction_type: crate::protocol::InteractionType::Request,
+                                encoding_type: EncodingType::Json,
+                                encryption_mode: EncryptionMode::None,
+                                terminal_id: id,
+                                msg_number: id,
+                                msg_package_total: 1,
+                                msg_package_num: 1,
+                                is_subpackage: false,
+                                data: serde_json::to_vec(&data).unwrap(),
+                            };
+                            debug!(?packet, "built print job packet");
+
+                            let packet = manager.wait_for_response(packet).await.unwrap();
+                            debug!(?packet, "got response packet");
+
+                            #[derive(Debug, Deserialize)]
+                            #[serde(rename_all = "kebab-case")]
+                            struct JobResult {
+                                job_id: u32,
                             }
+
+                            let job_id = packet
+                                .as_json::<AvocadoResult<JobResult>>()
+                                .unwrap()
+                                .result
+                                .job_id;
+                            debug!(job_id, "got job id");
+
+                            manager
+                                .send_data(job_id, &buf, |total, sent| {
+                                    debug!(total, sent, "sent data packet");
+                                    let _ =
+                                        tx.send(Action::SendProgress(sent as f32 / total as f32));
+                                })
+                                .await
+                                .unwrap();
+
+                            manager.poll_job(job_id).await.unwrap();
+                            info!("finished sending data");
                         });
                     }
+                } else {
+                    if let Some(send_progress) = self.send_progress {
+                        ui.horizontal(|ui| {
+                            ui.label("Data transfer: ");
+                            ui.add(
+                                egui::ProgressBar::new(send_progress)
+                                    .show_percentage()
+                                    .animate(true),
+                            );
+                        });
+                    }
+
+                    if let Some(status) = &self.job_status {
+                        ui.horizontal(|ui| {
+                            ui.label("State: ");
+                            ui.label(serde_plain::to_string(&status.job_state).unwrap_or_default());
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Sub State: ");
+                            ui.label(
+                                serde_plain::to_string(&status.job_sub_state).unwrap_or_default(),
+                            );
+                        });
+                    }
+                }
+            }
+            TransportStatus::Connecting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Connecting");
                 });
+            }
+
+            TransportStatus::Disconnecting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Disconnecting");
+                });
+            }
+
+            TransportStatus::Disconnected => {
+                if ui.button("Connect").clicked() {
+                    let tx = self.tx.clone();
+
+                    let manager = TransportManager::new(self.get_transport(), move |event| {
+                        if let Err(err) = tx.send(Action::TransportEvent(event)) {
+                            error!("could not send transport event: {err}");
+                        }
+                    });
+
+                    self.transport_manager = Some(manager);
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for SapodillaApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_actions();
+
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                self.menu(ui, ctx);
             });
 
             let heading_style = egui::TextStyle::resolve(&egui::TextStyle::Heading, &ctx.style());
@@ -522,205 +722,114 @@ impl eframe::App for SapodillaApp {
             .default_width(350.0)
             .width_range(150.0..=400.0)
             .show(ctx, |ui| {
-                ui.heading("Device");
+                ui.heading("Connection");
 
-                match self.transport_status {
-                    TransportStatus::Connected => {
-                        if ui.button("Disconnect").clicked()
-                            && let Some(manager) = self.transport_manager.take()
-                        {
-                            let tx = self.tx.clone();
-                            spawn(async move {
-                                if let Err(err) = manager.disconnect().await {
-                                    tx.send(Action::Error(err)).unwrap();
-                                }
-                            });
-                        }
-
-                        if let Some(status) = &self.device_status {
-                            ui.horizontal(|ui| {
-                                ui.label("State: ");
-                                ui.label(serde_plain::to_string(&status.0).unwrap());
-                            });
-
-                            ui.horizontal(|ui| {
-                                ui.label("Sub State: ");
-                                ui.label(serde_plain::to_string(&status.1).unwrap());
-                            });
-
-                            ui.horizontal(|ui| {
-                                ui.label("Alerts: ");
-                                ui.label(&status.2);
-                            });
-                        }
-
-                        ui.separator();
-
-                        ui.heading("Current Job");
-
-                        if self.send_progress.is_none() && self.job_status.is_none() {
-                            if ui.button("Print Canvas").clicked() {
-                                let im = self.render_image();
-                                let buf = encode_image(&im);
-
-                                let manager = self.transport_manager.clone().unwrap();
-                                let tx = self.tx.clone();
-                                self.send_progress = None;
-
-                                let hash = sha1::Sha1::digest(&buf);
-                                debug!("calculated image hash: {}", hex::encode(hash));
-
-                                let time = current_timestamp_millis();
-
-                                spawn(async move {
-                                    let id = manager.next_message_id();
-                                    let packet = AvocadoPacket {
-                                        version: 100,
-                                        content_type: crate::protocol::ContentType::Message,
-                                        interaction_type: crate::protocol::InteractionType::Request,
-                                        encoding_type: EncodingType::Json,
-                                        encryption_mode: EncryptionMode::None,
-                                        terminal_id: id,
-                                        msg_number: id,
-                                        msg_package_total: 1,
-                                        msg_package_num: 1,
-                                        is_subpackage: false,
-                                        data: serde_json::to_vec(&serde_json::json!({
-                                            "id": id,
-                                            "method": "print-job",
-                                            "params": {
-                                                "media-size": 5012,
-                                                "media-type": 2010,
-                                                "job-type": 0,
-                                                "channel": 30784,
-                                                "file-size": buf.len(),
-                                                "document-format": 9,
-                                                "document-name": format!("{}.jpeg", time),
-                                                "hash-method": 1,
-                                                "hash-value": hex::encode(hash),
-                                                "user-account": "000000.00000000000000000000000000000000.0000",
-                                                "link-type": 1000,
-                                                "job-send-time": time / 1000,
-                                                "copies": 1,
-                                            },
-                                        })).unwrap(),
-                                    };
-                                    debug!(?packet, "built print job packet");
-                                    let packet = manager.wait_for_response(packet).await.unwrap();
-                                    debug!(?packet, "got response packet");
-
-                                    #[derive(Debug, Deserialize)]
-                                    #[serde(rename_all = "kebab-case")]
-                                    struct JobResult {
-                                        job_id: u32,
-                                    }
-
-                                    let job_id = packet.as_json::<AvocadoResult<JobResult>>().unwrap().result.job_id;
-                                    debug!(job_id, "got job id");
-
-                                    manager
-                                        .send_data(job_id, &buf, |total, sent| {
-                                            debug!(total, sent, "sent data packet");
-                                            let _ = tx.send(Action::SendProgress(
-                                                sent as f32 / total as f32,
-                                            ));
-                                        })
-                                        .await
-                                        .unwrap();
-
-                                    manager.poll_job(job_id).await.unwrap();
-                                    info!("finished sending data");
-                                });
-                            }
-                        } else {
-                            if let Some(send_progress) = self.send_progress {
-                                ui.horizontal(|ui| {
-                                    ui.label("Data transfer: ");
-                                    ui.add(
-                                        egui::ProgressBar::new(send_progress)
-                                            .show_percentage()
-                                            .animate(true),
-                                    );
-                                });
-                            }
-
-                            if let Some(status) = &self.job_status {
-                                ui.horizontal(|ui| {
-                                    ui.label("State: ");
-                                    ui.label(serde_plain::to_string(&status.job_state).unwrap_or_default());
-                                });
-
-                                ui.horizontal(|ui| {
-                                    ui.label("Sub State: ");
-                                    ui.label(
-                                        serde_plain::to_string(&status.job_sub_state).unwrap_or_default(),
-                                    );
-                                });
-                            }
-                        }
-                    }
-                    TransportStatus::Connecting => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Connecting");
-                        });
-                    }
-
-                    TransportStatus::Disconnecting => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Disconnecting");
-                        });
-                    }
-
-                    TransportStatus::Disconnected => {
-                        if ui.button("Connect").clicked() {
-                            let tx = self.tx.clone();
-
-                            let manager = TransportManager::new(
-                                self.get_transport(),
-                                move |event| {
-                                    if let Err(err) = tx.send(Action::TransportEvent(event)) {
-                                        error!("could not send transport event: {err}");
-                                    }
-                                },
-                            );
-
-                            self.transport_manager = Some(manager);
-                        }
-                    }
-                }
+                self.device_status(ui);
 
                 ui.separator();
 
-                views::cut_controls(ui, &mut self.cut_tuning, self.cut_progress, self.has_intersections, self.off_canvas);
+                ui.heading("Settings");
 
-                if ui.add_enabled(
-                    self.cut_progress.is_none(),
-                    egui::Button::new("Generate Cut Lines")
-                ).clicked() {
-                    self.cut_shapes.clear();
-                    self.has_intersections = false;
-                    self.off_canvas = false;
-                    self.cut_progress = None;
-
-                    let tx = self.tx.clone();
-                    let mut rx = CutGenerator::start(self.loaded_images.clone(), self.cut_tuning.clone(), Vec2::new(4.0 * 300.0, 6.0 * 300.0));
-
-                    spawn(async move {
-                        while let Some(action) = rx.next().await {
-                            debug!(?action, "got cut action");
-
-                            if let Err(err) = tx.send(Action::Cut(action)) {
-                                error!("could not send cut action: {err}");
-                            }
-                        }
+                let previous = self.selected_device;
+                egui::ComboBox::from_label("Device")
+                    .selected_text(&DEVICES[self.selected_device].name)
+                    .show_index(ui, &mut self.selected_device, DEVICES.len(), |i| {
+                        &DEVICES[i].name
                     });
+                if self.selected_device != previous {
+                    self.selected_mode = 0;
+                    self.selected_canvas_size = 0;
+                }
+
+                let previous = self.selected_mode;
+                egui::ComboBox::from_label("Mode")
+                    .selected_text(
+                        DEVICES[self.selected_device].modes[self.selected_mode]
+                            .mode_type
+                            .name(),
+                    )
+                    .show_index(
+                        ui,
+                        &mut self.selected_mode,
+                        DEVICES[self.selected_device].modes.len(),
+                        |i| DEVICES[self.selected_device].modes[i].mode_type.name(),
+                    );
+                if self.selected_mode != previous {
+                    self.selected_canvas_size = 0;
+                }
+
+                egui::ComboBox::from_label("Canvas Size")
+                    .selected_text(
+                        &DEVICES[self.selected_device].modes[self.selected_mode].canvas_sizes
+                            [self.selected_canvas_size]
+                            .name,
+                    )
+                    .show_index(
+                        ui,
+                        &mut self.selected_canvas_size,
+                        DEVICES[self.selected_device].modes[self.selected_mode]
+                            .canvas_sizes
+                            .len(),
+                        |i| {
+                            &DEVICES[self.selected_device].modes[self.selected_mode].canvas_sizes[i]
+                                .name
+                        },
+                    );
+
+                if DEVICES[self.selected_device].modes[self.selected_mode]
+                    .mode_type
+                    .has_cutting()
+                {
+                    ui.separator();
+
+                    views::cut_controls(
+                        ui,
+                        DEVICES[self.selected_device].dpi,
+                        &mut self.cut_tuning,
+                        self.cut_progress,
+                        self.has_intersections,
+                        self.off_canvas,
+                    );
+
+                    if ui
+                        .add_enabled(
+                            self.cut_progress.is_none(),
+                            egui::Button::new("Generate Cut Lines"),
+                        )
+                        .clicked()
+                    {
+                        self.cut_shapes.clear();
+                        self.has_intersections = false;
+                        self.off_canvas = false;
+                        self.cut_progress = None;
+
+                        let tx = self.tx.clone();
+                        let mut rx = CutGenerator::start(
+                            self.loaded_images.clone(),
+                            self.cut_tuning.clone(),
+                            self.get_canvas(),
+                        );
+
+                        spawn(async move {
+                            while let Some(action) = rx.next().await {
+                                debug!(?action, "got cut action");
+
+                                if let Err(err) = tx.send(Action::Cut(action)) {
+                                    error!("could not send cut action: {err}");
+                                }
+                            }
+                        });
+                    }
                 }
 
                 if !self.loaded_images.is_empty() {
                     ui.separator();
-                    views::loaded_images(ui, &mut self.loaded_images);
+                    views::loaded_images(
+                        ui,
+                        DEVICES[self.selected_device].dpi,
+                        self.get_canvas().size,
+                        &mut self.loaded_images,
+                    );
                 }
             });
 

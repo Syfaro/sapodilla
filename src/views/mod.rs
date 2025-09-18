@@ -255,16 +255,26 @@ fn packet_details(ui: &mut Ui, has_exactly_one: bool, index: usize, packet: &Avo
         });
 }
 
-pub fn loaded_images(ui: &mut Ui, loaded_images: &mut Vec<LoadedImage>) {
+pub fn loaded_images(
+    ui: &mut Ui,
+    dpi: f32,
+    canvas_size: Vec2,
+    loaded_images: &mut Vec<LoadedImage>,
+) {
     ui.heading("Images");
 
     let mut remove = None;
 
-    for (index, image) in loaded_images.iter_mut().enumerate() {
-        image_controls(ui, image, index, &mut remove);
+    ui.spacing_mut().scroll.floating = false;
 
-        ui.add_space(16.0);
-    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for (index, image) in loaded_images.iter_mut().enumerate() {
+                image_controls(ui, dpi, canvas_size, image, index, &mut remove);
+                ui.add_space(16.0);
+            }
+        });
 
     if let Some(remove) = remove {
         loaded_images.remove(remove);
@@ -273,6 +283,8 @@ pub fn loaded_images(ui: &mut Ui, loaded_images: &mut Vec<LoadedImage>) {
 
 pub fn image_controls(
     ui: &mut Ui,
+    dpi: f32,
+    canvas_size: Vec2,
     image: &mut LoadedImage,
     index: usize,
     remove_index: &mut Option<usize>,
@@ -295,24 +307,24 @@ pub fn image_controls(
                 ui.monospace("X:");
                 ui.add(px_slider(
                     &mut image.offset.x,
-                    300.0,
+                    dpi,
                     (-image.sized_texture.size.x * 2.0)
-                        ..=((4.0 * 300.0) + image.sized_texture.size.x * 2.0),
+                        ..=(canvas_size.x + image.sized_texture.size.x * 2.0),
                 ));
 
                 ui.monospace("Y:");
                 ui.add(px_slider(
                     &mut image.offset.y,
-                    300.0,
+                    dpi,
                     (-image.sized_texture.size.y * 2.0)
-                        ..=((6.0 * 300.0) + image.sized_texture.size.y * 2.0),
+                        ..=(canvas_size.y + image.sized_texture.size.y * 2.0),
                 ));
             });
 
             ui.horizontal(|ui| {
                 ui.monospace("W:");
                 let mut width = image.size().x;
-                ui.add(px_slider(&mut width, 300.0, 1.0..=(4.0 * 300.0 * 10.0)));
+                ui.add(px_slider(&mut width, dpi, 1.0..=(canvas_size.x * 10.0)));
 
                 if width != image.size().x {
                     let new_scale = if image.scale_locked {
@@ -329,7 +341,7 @@ pub fn image_controls(
 
                 ui.monospace("H:");
                 let mut height = image.size().y;
-                ui.add(px_slider(&mut height, 300.0, 1.0..=(4.0 * 300.0 * 10.0)));
+                ui.add(px_slider(&mut height, dpi, 1.0..=(canvas_size.y * 10.0)));
 
                 if height != image.size().y {
                     let new_scale = if image.scale_locked {
@@ -361,7 +373,7 @@ pub fn image_controls(
 
 pub fn px_slider<'a>(
     value: &'a mut f32,
-    dpi: f64,
+    dpi: f32,
     range: RangeInclusive<f32>,
 ) -> egui::DragValue<'a> {
     egui::DragValue::new(value)
@@ -372,7 +384,7 @@ pub fn px_slider<'a>(
             let lower = val.trim().to_ascii_lowercase();
 
             if let Some(val) = lower.strip_suffix("in") {
-                val.trim().parse().map(|val: f64| val * dpi).ok()
+                val.trim().parse().map(|val: f64| val * f64::from(dpi)).ok()
             } else {
                 val.strip_suffix("px").unwrap_or(&lower).trim().parse().ok()
             }
@@ -381,6 +393,7 @@ pub fn px_slider<'a>(
 
 pub fn cut_controls(
     ui: &mut Ui,
+    dpi: f32,
     cut_tuning: &mut CutTuning,
     progress: Option<(usize, usize)>,
     has_intersections: bool,
@@ -401,23 +414,23 @@ pub fn cut_controls(
 
     ui.checkbox(&mut cut_tuning.internal, "Allow Internal Cuts");
 
-    let mut buffer = cut_tuning.buffer / 300.0 * 25.4;
+    let mut buffer = cut_tuning.buffer / dpi * 25.4;
     ui.add(
         egui::Slider::new(&mut buffer, 0.0..=5.0)
             .suffix(" mm")
             .text("Padding Distance"),
     )
     .on_hover_text("Padding between the edges of the sticker and the cutline");
-    cut_tuning.buffer = buffer * 300.0 / 25.4;
+    cut_tuning.buffer = buffer * dpi / 25.4;
 
-    let mut minimum_length = cut_tuning.minimum_length / 300.0;
+    let mut minimum_length = cut_tuning.minimum_length / dpi;
     ui.add(
         egui::Slider::new(&mut minimum_length, 0.05..=1.0)
             .suffix(" in")
             .text("Minimum Cut Length"),
     )
     .on_hover_text("Minimum length to cut, anything smaller will be ignored");
-    cut_tuning.minimum_length = minimum_length * 300.0;
+    cut_tuning.minimum_length = minimum_length * dpi;
 
     ui.collapsing("Advanced Settings", |ui| {
         ui.add(egui::Slider::new(&mut cut_tuning.simplify, 0.0..=5.0).text("Simplify Amount"))
