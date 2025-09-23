@@ -13,11 +13,14 @@ lazy_static! {
         name: "PixCut S1".to_string(),
         model: "DHP700".to_string(),
         dpi: 300.0,
+        cutter_scale_factor: 3.38667,
         modes: vec![
             Mode {
                 mode_type: ModeType::Print,
                 canvas_sizes: vec![CanvasSize {
                     name: "4x6".to_string(),
+                    media_size: 5012,
+                    media_type: 2010,
                     size: Vec2::new(4.0 * 300.0, 6.0 * 300.0),
                     safe_area: Vec2::new(4.0 * 300.0, 6.0 * 300.0),
                 }]
@@ -26,8 +29,10 @@ lazy_static! {
                 mode_type: ModeType::PrintAndCut,
                 canvas_sizes: vec![CanvasSize {
                     name: "4x7".to_string(),
+                    media_size: 5013,
+                    media_type: 2030,
                     size: Vec2::new(4.0 * 300.0, 7.0 * 300.0),
-                    safe_area: Vec2::new(3.543 * 300.0, 6.693 * 300.0),
+                    safe_area: Vec2::new(3.62 * 300.0, 6.77 * 300.0),
                 }]
             }
         ]
@@ -447,6 +452,7 @@ pub struct Device {
     pub name: String,
     pub model: String,
     pub dpi: f32,
+    pub cutter_scale_factor: f32,
     pub modes: Vec<Mode>,
 }
 
@@ -464,6 +470,27 @@ impl ModeType {
         }
     }
 
+    pub fn channel(&self) -> u16 {
+        match self {
+            ModeType::Print => 30784,
+            ModeType::PrintAndCut => 30960,
+        }
+    }
+
+    pub fn job_type(&self) -> u16 {
+        match self {
+            ModeType::Print => 0,
+            ModeType::PrintAndCut => 600,
+        }
+    }
+
+    pub fn link_type(&self) -> u16 {
+        match self {
+            ModeType::Print => 1000,
+            ModeType::PrintAndCut => 0,
+        }
+    }
+
     pub fn has_cutting(&self) -> bool {
         matches!(self, ModeType::PrintAndCut)
     }
@@ -478,6 +505,8 @@ pub struct Mode {
 #[derive(Debug, Clone)]
 pub struct CanvasSize {
     pub name: String,
+    pub media_size: u16,
+    pub media_type: u16,
     pub size: Vec2,
     pub safe_area: Vec2,
 }

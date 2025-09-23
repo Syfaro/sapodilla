@@ -158,7 +158,7 @@ This method requires an object with the following fields.
 | Name              | Type   | Description                                                          |
 | ----------------- | ------ | -------------------------------------------------------------------- |
 | `media-size`      | Number | Size of paper, 5012 for 4x6, 5013 for 4x7                            |
-| `media-type`      | Number | Type of media, 2010 for photo 4x6                                    |
+| `media-type`      | Number | Type of media, 2010 for photo 4x6, 2030 for sticker 4x7              |
 | `job-type`        | Number | Type of print job, 0 for photo, 600 for photo and cutting            |
 | `channel`         | Number | Unknown, observed values of 30784 and 30960                          |
 | `file-size`       | Number | Bytes of file                                                        |

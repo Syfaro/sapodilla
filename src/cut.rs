@@ -291,8 +291,8 @@ impl CutGenerator {
 
     /// Mirror generated cut lines for sending to the device.
     #[allow(dead_code)]
-    pub fn mirror_cuts(
-        polygons: impl IntoIterator<Item = MultiPolygon<f32>>,
+    pub fn mirror_cuts<'a>(
+        polygons: impl IntoIterator<Item = &'a MultiPolygon<f32>>,
         canvas_size: Vec2,
     ) -> impl Iterator<Item = MultiPolygon<f32>> {
         let point = Coord::from((canvas_size.x, canvas_size.y / 2.0));

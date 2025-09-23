@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::VecDeque, sync::mpsc};
+use std::{borrow::Cow, collections::VecDeque, io::Write, sync::mpsc};
 
 use egui::{Id, KeyboardShortcut, Modal, Modifiers, Pos2, Vec2};
 use futures::{StreamExt, lock::Mutex};
@@ -44,6 +44,7 @@ pub struct SapodillaApp {
     pub selected_mode: usize,
     pub selected_canvas_size: usize,
     pub previous_canvas_size: Vec2,
+    pub copies: usize,
 
     pub device_status: Option<(PrinterState, PrinterSubState, String)>,
     pub job_status: Option<JobStatusInfo>,
@@ -180,6 +181,7 @@ impl SapodillaApp {
             selected_mode: 0,
             selected_canvas_size: 0,
             previous_canvas_size: Vec2::ZERO,
+            copies: 1,
 
             device_status: None,
             job_status: None,
@@ -565,44 +567,103 @@ impl SapodillaApp {
                 if self.send_progress.is_none() && self.job_status.is_none() {
                     if ui.button("Print Canvas").clicked() {
                         let im = self.render_image();
-                        let buf = encode_image(&im);
+                        let encoded_image = encode_image(&im);
+                        let encoded_image_len = encoded_image.len();
+                        let mode = &DEVICES[self.selected_device].modes[self.selected_mode];
+                        let canvas_size = &mode.canvas_sizes[self.selected_canvas_size];
+                        let plt = encode_plt(
+                            &self.cut_shapes,
+                            DEVICES[self.selected_device].cutter_scale_factor,
+                            canvas_size,
+                        );
 
                         let manager = self.transport_manager.clone().unwrap();
                         let tx = self.tx.clone();
+                        let copies = self.copies;
                         self.send_progress = None;
 
-                        let hash = sha1::Sha1::digest(&buf);
+                        let hash = sha1::Sha1::digest(&encoded_image);
                         debug!("calculated image hash: {}", hex::encode(hash));
 
                         let time = current_timestamp_millis();
 
+                        let packet_data = if mode.mode_type.has_cutting() {
+                            let mut buf = Vec::with_capacity(encoded_image.len() + plt.len());
+                            buf.extend_from_slice(&plt);
+                            buf.extend_from_slice(&encoded_image);
+                            buf
+                        } else {
+                            encoded_image
+                        };
+
                         spawn(async move {
                             let id = manager.next_message_id();
 
-                            let data = serde_json::json!({
-                                "id": id,
-                                "method": "print-job",
-                                "params": {
-                                    "media-size": 5012,
-                                    "media-type": 2010,
-                                    "job-type": 0,
-                                    "channel": 30784,
-                                    "file-size": buf.len(),
-                                    "document-format": 9,
-                                    "document-name": format!("{}.jpeg", time),
-                                    "hash-method": 1,
-                                    "hash-value": hex::encode(hash),
-                                    "user-account": "000000.00000000000000000000000000000000.0000",
-                                    "link-type": 1000,
-                                    "job-send-time": time / 1000,
-                                    "copies": 1,
-                                },
-                            });
+                            let data = if mode.mode_type.has_cutting() {
+                                serde_json::json!({
+                                    "id": id,
+                                    "method": "combo-job",
+                                    "params": [
+                                        {
+                                            "method": "print-job",
+                                            "params": {
+                                                "media-size": canvas_size.media_size,
+                                                "media-type": canvas_size.media_type,
+                                                "job-type": mode.mode_type.job_type(),
+                                                "channel": mode.mode_type.channel(),
+                                                "file-size": encoded_image_len,
+                                                "document-format": 9,
+                                                "document-name": format!("{}.jpeg", time),
+                                                "hash-method": 1,
+                                                "hash-value": hex::encode(hash),
+                                                "user-account": "000000.00000000000000000000000000000000.0000",
+                                                "job-send-time": time / 1000,
+                                                "link-type": mode.mode_type.link_type(),
+                                                "copies": copies,
+                                            }
+                                        },
+                                        {
+                                            "method": "cut-job",
+                                            "params": {
+                                                "copies": copies,
+                                                "media-size": canvas_size.media_size,
+                                                "document-name": format!("{}.plt", time),
+                                                "file-size": plt.len(),
+                                                "channel": mode.mode_type.channel(),
+                                                "media-type": canvas_size.media_type,
+                                                "job-type": mode.mode_type.job_type(),
+                                                "document-format": 18,
+                                                "job-send-time": time / 1000,
+                                            }
+                                        }
+                                    ],
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "id": id,
+                                    "method": "print-job",
+                                    "params": {
+                                        "media-size": canvas_size.media_size,
+                                        "media-type": canvas_size.media_type,
+                                        "job-type": mode.mode_type.job_type(),
+                                        "channel": mode.mode_type.channel(),
+                                        "file-size": encoded_image_len,
+                                        "document-format": 9,
+                                        "document-name": format!("{}.jpeg", time),
+                                        "hash-method": 1,
+                                        "hash-value": hex::encode(hash),
+                                        "user-account": "000000.00000000000000000000000000000000.0000",
+                                        "link-type": mode.mode_type.link_type(),
+                                        "job-send-time": time / 1000,
+                                        "copies": copies,
+                                    },
+                                })
+                            };
 
                             let packet = AvocadoPacket {
                                 version: 100,
-                                content_type: crate::protocol::ContentType::Message,
-                                interaction_type: crate::protocol::InteractionType::Request,
+                                content_type: ContentType::Message,
+                                interaction_type: InteractionType::Request,
                                 encoding_type: EncodingType::Json,
                                 encryption_mode: EncryptionMode::None,
                                 terminal_id: id,
@@ -631,7 +692,7 @@ impl SapodillaApp {
                             debug!(job_id, "got job id");
 
                             manager
-                                .send_data(job_id, &buf, |total, sent| {
+                                .send_data(job_id, &packet_data, |total, sent| {
                                     debug!(total, sent, "sent data packet");
                                     let _ =
                                         tx.send(Action::SendProgress(sent as f32 / total as f32));
@@ -775,6 +836,11 @@ impl eframe::App for SapodillaApp {
                                 .name
                         },
                     );
+
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.copies).range(1..=10));
+                    ui.label("Copies");
+                });
 
                 if DEVICES[self.selected_device].modes[self.selected_mode]
                     .mode_type
@@ -927,6 +993,54 @@ fn encode_image(im: &image::DynamicImage) -> Vec<u8> {
     }
 
     buf
+}
+
+fn encode_plt(
+    cut_shapes: &[geo::MultiPolygon<f32>],
+    cutter_scale_factor: f32,
+    canvas_size: &CanvasSize,
+) -> Vec<u8> {
+    let mut buf = b"IN VER0.1.0 KP42 ".to_vec();
+
+    let flipped = CutGenerator::mirror_cuts(cut_shapes.iter(), canvas_size.size);
+
+    for multi_polygon in flipped {
+        for polygon in multi_polygon {
+            write_line_string(cutter_scale_factor, &mut buf, polygon.exterior());
+
+            for interior in polygon.interiors() {
+                write_line_string(cutter_scale_factor, &mut buf, interior);
+            }
+        }
+    }
+
+    write!(buf, " U6476,0 @ ").unwrap();
+
+    buf
+}
+
+fn write_line_string(
+    cutter_scale_factor: f32,
+    buf: &mut Vec<u8>,
+    line_shape: &geo::LineString<f32>,
+) {
+    write!(
+        buf,
+        " U{:.0},{:.0}",
+        line_shape.0[0].y * cutter_scale_factor,
+        line_shape.0[0].x * cutter_scale_factor
+    )
+    .unwrap();
+
+    for point in line_shape.coords() {
+        write!(
+            buf,
+            " D{:.0},{:.0}",
+            point.y * cutter_scale_factor,
+            point.x * cutter_scale_factor
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -25,11 +25,11 @@ the latest version [here](https://sapodilla.pages.dev).
     - [x] Cut mark preview
     - [x] Cut mark generation
     - [ ] Upload format supporting cut marks
-- [ ] Photo Printing
+- [x] Photo Printing
     - [x] Single print job
-    - [ ] Set number of copies
-- [ ] Sticker Cutting and Printing
-    - [ ] Print and cut job
+    - [x] Set number of copies
+- [x] Sticker Cutting and Printing
+    - [x] Print and cut job
 
 ## Protocol
 
