@@ -6,6 +6,13 @@
 
 An alternative interface for the PixCut S1.
 
+This currently supports all basic features required to print photos or print and
+cut stickers on the PixCut S1. You can connect to the device, upload images,
+position them, generate cut marks, and run the job.
+
+However, the UI is not ready for end users. It doesn't control the flow well
+and will allow you to do things out of order that might confuse the device.
+
 ## Usage
 
 This is currently designed to be run in Chrome via WebAssembly. You can access

@@ -13,7 +13,10 @@ lazy_static! {
         name: "PixCut S1".to_string(),
         model: "DHP700".to_string(),
         dpi: 300.0,
-        cutter_scale_factor: 3.38667,
+        cutter_calibration: Some(CutterCalibration {
+            scale_factor: 3.38667 * 1.01333,
+            offset: Vec2::new(-9.0, -13.0),
+        }),
         modes: vec![
             Mode {
                 mode_type: ModeType::Print,
@@ -452,8 +455,23 @@ pub struct Device {
     pub name: String,
     pub model: String,
     pub dpi: f32,
-    pub cutter_scale_factor: f32,
+    pub cutter_calibration: Option<CutterCalibration>,
     pub modes: Vec<Mode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CutterCalibration {
+    pub scale_factor: f32,
+    pub offset: Vec2,
+}
+
+impl Default for CutterCalibration {
+    fn default() -> Self {
+        Self {
+            scale_factor: 1.0,
+            offset: Vec2::ZERO,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
